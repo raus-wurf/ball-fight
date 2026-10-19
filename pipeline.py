@@ -1851,6 +1851,22 @@ def upload_tiktok(video_path: str, title: str, hashtags: Optional[list[str]] = N
         caption  = f"{caption} {tag_line}"[:2200]
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    # TikTok requires an explicit privacy level that the creator allows;
+    # read the allowed ones and prefer public, fall back to public on error.
+    privacy = "PUBLIC_TO_EVERYONE"
+    try:
+        info = requests.get(
+            f"{ZERNIO_API}/accounts/{account_id}/tiktok/creator-info",
+            headers=headers, params={"mediaType": "video"}, timeout=20,
+        ).json()
+        levels = [p.get("value") for p in info.get("privacyLevels", []) if p.get("value")]
+        if levels and privacy not in levels:
+            privacy = levels[0]
+            log.warning("Zernio: public posting not allowed for this account — using %s", privacy)
+    except Exception as e:
+        log.warning("Zernio: creator-info lookup failed (%s) — assuming public", e)
+
     try:
         presign = requests.post(
             f"{ZERNIO_API}/media/presign", headers=headers,
@@ -1869,24 +1885,46 @@ def upload_tiktok(video_path: str, title: str, hashtags: Optional[list[str]] = N
             log.warning("Zernio: video PUT failed (%d)", put.status_code)
             return None
 
-        post = requests.post(
+        # publishNow=True is essential: without it (or scheduledFor) Zernio
+        # silently saves the post as a DRAFT and nothing reaches TikTok.
+        resp = requests.post(
             f"{ZERNIO_API}/posts", headers=headers,
             json={
                 "content": caption,
                 "mediaItems": [{"type": "video", "url": public_url}],
                 "platforms": [{"platform": "tiktok", "accountId": account_id}],
+                "tiktokSettings": {
+                    "privacy_level": privacy,
+                    "allow_comment": True,
+                    "allow_duet": True,
+                    "allow_stitch": True,
+                    "content_preview_confirmed": True,
+                    "express_consent_given": True,
+                },
+                "publishNow": True,
             },
-            timeout=60,
-        ).json()
+            timeout=120,
+        )
+        post = resp.json()
     except Exception as e:
         log.warning("Zernio: upload failed: %s", e)
         return None
 
-    post_id = (post.get("post") or {}).get("_id") or post.get("_id") or post.get("id")
+    # 201 = published; 207 = created but TikTok rejected it (see errorMessage)
+    post_obj = post.get("post") or {}
+    for plat in post_obj.get("platforms", []):
+        if plat.get("status") == "failed":
+            log.warning("Zernio: TikTok rejected the post: %s", plat.get("errorMessage"))
+    if resp.status_code not in (200, 201) or post_obj.get("status") in ("failed", "draft"):
+        log.warning("Zernio: post not published (HTTP %d, status=%s): %s",
+                    resp.status_code, post_obj.get("status"), post)
+        return None
+
+    post_id = post_obj.get("_id") or post.get("_id") or post.get("id")
     if not post_id:
         log.warning("Zernio: unexpected post response: %s", post)
         return None
-    log.info("Zernio: TikTok post created — %s", post_id)
+    log.info("Zernio: TikTok post %s — status=%s", post_id, post_obj.get("status"))
     return post_id
 
 
