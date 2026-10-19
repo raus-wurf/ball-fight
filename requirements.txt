@@ -1,0 +1,27 @@
+# ── Core ──────────────────────────────────────────────────────────────
+groq>=0.4.0
+requests>=2.31.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# ── Ball Fight physics engine ───────────────────────────────────────────
+pymunk>=6.6.0                # 2D physics sim (battle royale / infection / race)
+
+# ── TTS ───────────────────────────────────────────────────────────────
+edge-tts>=6.1.9
+gTTS>=2.5.0                 # absolute last-resort TTS fallback (no key needed)
+openai>=1.0.0              # OpenAI TTS (onyx) — set OPENAI_API_KEY
+
+# ── Audio ─────────────────────────────────────────────────────────────
+pydub>=0.25.1
+scipy>=1.11.0              # SFX synthesis
+
+# ── Video ─────────────────────────────────────────────────────────────
+moviepy>=2.0.0
+beautiful-captions>=0.1.71  # Bounce-animated TikTok-style captions
+
+# ── YouTube ───────────────────────────────────────────────────────────
+google-auth>=2.22.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
