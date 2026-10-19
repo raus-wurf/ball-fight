@@ -1,0 +1,46 @@
+name: VaultMind Ball Fight Pipeline
+"on":
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch: {}
+jobs:
+  generate-ballfight-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps (ffmpeg + fonts)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg fonts-dejavu-core fonts-liberation fonts-open-sans
+          echo "ffmpeg: $(ffmpeg -version | head -1)"
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Fix beautiful-captions import bug
+        run: |
+          python3 -c "
+          import site, pathlib
+          pkg = pathlib.Path(site.getsitepackages()[0]) / 'beautiful_captions'
+          if pkg.exists():
+              for f in pkg.rglob('*.py'):
+                  t = f.read_text()
+                  if 'from src.beautiful_captions' in t:
+                      f.write_text(t.replace('from src.beautiful_captions.core.', 'from .'))
+                      print('Patched:', f)
+          "
+      - name: Generate + post ball-fight video
+        env:
+          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+          ELEVENLABS_KEY:       ${{ secrets.ELEVENLABS_KEY }}
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          ASSEMBLYAI_API_KEY:   ${{ secrets.ASSEMBLYAI_API_KEY }}
+          ZERNIO_API_KEY:       ${{ secrets.ZERNIO_API_KEY }}
+        run: python pipeline.py ballfight
