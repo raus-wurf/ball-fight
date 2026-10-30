@@ -1,8 +1,8 @@
 name: VaultMind Ball Fight Pipeline
 "on":
   schedule:
-    - cron: '0 17 * * *'
-  workflow_dispatch: {}
+    - cron: '0 17 * * *'    # once daily, 17:00 UTC — adjust to your best TikTok posting slot
+  workflow_dispatch: {}      # manual "Run workflow" button, no inputs needed
 jobs:
   generate-ballfight-video:
     runs-on: ubuntu-latest
@@ -24,23 +24,16 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Fix beautiful-captions import bug
-        run: |
-          python3 -c "
-          import site, pathlib
-          pkg = pathlib.Path(site.getsitepackages()[0]) / 'beautiful_captions'
-          if pkg.exists():
-              for f in pkg.rglob('*.py'):
-                  t = f.read_text()
-                  if 'from src.beautiful_captions' in t:
-                      f.write_text(t.replace('from src.beautiful_captions.core.', 'from .'))
-                      print('Patched:', f)
-          "
       - name: Generate + post ball-fight video
         env:
-          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
-          ELEVENLABS_KEY:       ${{ secrets.ELEVENLABS_KEY }}
-          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
-          ASSEMBLYAI_API_KEY:   ${{ secrets.ASSEMBLYAI_API_KEY }}
-          ZERNIO_API_KEY:       ${{ secrets.ZERNIO_API_KEY }}
-        run: python pipeline.py ballfight
+          GROQ_API_KEY:              ${{ secrets.GROQ_API_KEY }}
+          ELEVENLABS_KEY:            ${{ secrets.ELEVENLABS_KEY }}
+          OPENAI_API_KEY:            ${{ secrets.OPENAI_API_KEY }}
+          # Preferred TikTok route (public posts): Zernio
+          ZERNIO_API_KEY:            ${{ secrets.ZERNIO_API_KEY }}
+          ZERNIO_TIKTOK_ACCOUNT_ID:  ${{ secrets.ZERNIO_TIKTOK_ACCOUNT_ID }}
+          # Fallback when no Zernio key is set: direct TikTok API (private posts until audited)
+          TIKTOK_CLIENT_KEY:         ${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET:      ${{ secrets.TIKTOK_CLIENT_SECRET }}
+          TIKTOK_REFRESH_TOKEN:      ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+        run: python pipeline.py
