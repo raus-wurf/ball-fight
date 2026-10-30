@@ -1,21 +1,19 @@
 """
-VaultMind Auto Video Pipeline — v4
-Major upgrades over v3:
-  ┌─────────────────────────────────────────────────────────┐
-  │  • Pexels VIDEOS as backgrounds (not static images)     │
-  │  • Word-by-word animated captions (viral MrBeast style) │
-  │  • Creatomate cloud render (optional, premium quality)   │
-  │  • Zoom-punch transitions via ffmpeg                     │
-  │  • Aggressive viral script prompts                       │
-  │  • Auto font download (Impact/Montserrat Black)          │
-  └─────────────────────────────────────────────────────────┘
+VaultMind Ball Fight — automated daily TikTok pipeline
+────────────────────────────────────────────────────────
+Simulates a short physics "ball fight" (pymunk), writes short bursts of
+AI commentary (Groq) tied to real in-sim events, mixes them with an
+always-epic synthesized music bed + collision SFX, appends a "<COLOR>
+WINS!" end card with a follow/like call-to-action, color-grades the
+result, and Direct-Posts it to TikTok via the Content Posting API.
+
+No burned-in captions — the video speaks (literally, sparingly) for
+itself.
 """
 
-import os, json, time, base64, pickle, random, logging, tempfile, textwrap
+import os, json, time, random, logging, tempfile
 import subprocess, shutil, math
-from io import BytesIO
 from pathlib import Path
-from datetime import datetime, timedelta
 from typing import Optional
 
 import pymunk
@@ -23,29 +21,11 @@ import pymunk
 import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import scipy.signal
 from pydub import AudioSegment
-from pydub.silence import detect_silence
-
-from moviepy import (
-    VideoFileClip, ImageClip, AudioFileClip,
-    CompositeVideoClip, concatenate_videoclips,
-    CompositeAudioClip, concatenate_audioclips,
-)
-from moviepy.video.fx import FadeIn, FadeOut, CrossFadeIn
-# ── Beautiful Captions (animated viral-style subtitles) ────────────────
-try:
-    from beautiful_captions import Video as BCVideo, CaptionConfig
-    BEAUTIFUL_CAPTIONS_OK = True
-except Exception:
-    BEAUTIFUL_CAPTIONS_OK = False
-    log_warn = print  # pre-logger fallback
 
 from groq import Groq
 import edge_tts, asyncio
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+import colorsys
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vaultmind")
@@ -55,157 +35,11 @@ log = logging.getLogger("vaultmind")
 # ══════════════════════════════════════════════════════════════════════
 VIDEO_W, VIDEO_H   = 1080, 1920
 FPS                = 30
-MIN_SCENES         = 20        # more scenes = faster cuts even at 80s+ (viral pacing)
-TARGET_DUR         = 85        # >60s required for Shorts monetization eligibility
-TRANSITION_DUR     = 0.22      # snappier cuts — matches faster viral edit rhythm
-FADE_IN_DUR        = 0.3
-FADE_OUT_DUR       = 0.5
 MUSIC_DUCK_DB      = -16
-CAPTION_WORDS      = 3        # words shown per caption chunk
-CAPTION_FONT_SIZE  = 95       # big & punchy
+FONT_PATH          = "font_bold.ttf"
 
-GAMEPLAY_PATH = os.getenv("GAMEPLAY_PATH", "gameplay_bg.mp4")
-MUSIC_PATH    = os.getenv("MUSIC_PATH",    "bg_music.mp3")
-SFX_WHOOSH    = "sfx_whoosh.mp3"
-SFX_IMPACT    = "sfx_impact.mp3"
-PIXABAY_KEY   = os.getenv("PIXABAY_KEY", "")
-FONT_PATH     = "font_bold.ttf"
-
+# Visual identity + ffmpeg color-grade curve for the Ball Fight niche.
 NICHES = {
-    # Each niche has:
-    #  color/glow/bg — visual identity
-    #  color_grade   — ffmpeg curves filter for cinematic look
-    #  video_queries — pool of Pexels search terms rotated randomly
-    #                  (avoids same footage appearing every video)
-    "reddit": {
-        "color": "#FF4500", "glow": "#FF6633", "bg": "#1A1A2E",
-        "color_grade": (
-            "curves=r='0/0 0.5/0.55 1/0.95':g='0/0 0.5/0.48 1/0.88':b='0/0 0.5/0.44 1/0.80',"
-            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.6"
-        ),
-        "video_queries": [
-            "person alone dark room", "dramatic phone screen night",
-            "crowded subway strangers", "rainy window city night",
-            "person walking alone", "shadow dramatic lighting",
-            "empty hallway dark", "late night city",
-        ],
-    },
-    "dating": {
-        "color": "#FF69B4", "glow": "#FF90C8", "bg": "#1A1A2E",
-        "color_grade": (
-            "curves=r='0/0.02 0.5/0.58 1/0.98':g='0/0 0.5/0.46 1/0.88':b='0/0 0.5/0.50 1/0.90',"
-            "unsharp=luma_msize_x=3:luma_msize_y=3:luma_amount=0.4"
-        ),
-        "video_queries": [
-            "romantic couple bokeh", "love hands holding",
-            "couple coffee date", "sunset romantic silhouette",
-            "first date restaurant", "flowers bokeh soft",
-            "couple walking city", "heartbreak alone rain",
-        ],
-    },
-    "rich": {
-        "color": "#FFD700", "glow": "#FFEC80", "bg": "#0D0D0D",
-        "color_grade": (
-            "curves=r='0/0 0.3/0.32 0.7/0.78 1/1.0':g='0/0 0.3/0.30 0.7/0.72 1/0.96':"
-            "b='0/0 0.3/0.22 0.7/0.58 1/0.78',"  # warm golden tone, pull blue
-            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.7"
-        ),
-        "video_queries": [
-            "luxury mansion interior", "private jet interior",
-            "sports car driving", "rolex watch close",
-            "penthouse city view", "yacht ocean luxury",
-            "cash money briefcase", "monaco luxury lifestyle",
-        ],
-    },
-    "lifehack": {
-        "color": "#00FF88", "glow": "#66FFBB", "bg": "#111111",
-        "color_grade": (
-            "curves=r='0/0 0.5/0.50 1/0.95':g='0/0 0.5/0.55 1/1.0':b='0/0 0.5/0.48 1/0.88',"
-            "unsharp=luma_msize_x=3:luma_msize_y=3:luma_amount=0.5"
-        ),
-        "video_queries": [
-            "person working laptop coffee", "productivity desk setup",
-            "person writing notes", "organized workspace minimal",
-            "hands typing keyboard", "brainstorm whiteboard",
-            "morning routine person", "phone productivity app",
-        ],
-    },
-    "fact": {
-        "color": "#00BFFF", "glow": "#66D9FF", "bg": "#0A0A1A",
-        "color_grade": (
-            "curves=r='0/0 0.3/0.27 0.7/0.72 1/0.92':"
-            "g='0/0 0.3/0.30 0.7/0.74 1/0.95':"
-            "b='0/0.05 0.3/0.38 0.7/0.78 1/1.0',"  # cool blue science feel
-            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.8"
-        ),
-        "video_queries": [
-            "galaxy stars universe timelapse", "ocean deep underwater",
-            "earth from space", "human brain neurons",
-            "microscope cells biology", "lightning storm dramatic",
-            "volcano eruption lava", "coral reef ocean life",
-        ],
-    },
-    "scary": {
-        "color": "#FF2222", "glow": "#FF6666", "bg": "#050505",
-        "color_grade": (
-            "curves=r='0/0 0.3/0.35 0.7/0.75 1/0.95':"
-            "g='0/0 0.3/0.22 0.7/0.55 1/0.78':"
-            "b='0/0 0.3/0.22 0.7/0.55 1/0.78',"  # desaturated red horror
-            "unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount=1.0"
-        ),
-        "video_queries": [
-            "dark forest fog night", "abandoned building corridor",
-            "horror shadows flickering", "empty road night fog",
-            "old door creaking dark", "basement dark stairs",
-            "person alone dark house", "storm lightning night",
-        ],
-    },
-    "motivation": {
-        "color": "#FF8C00", "glow": "#FFAA44", "bg": "#0D0D0D",
-        "color_grade": (
-            "curves=r='0/0 0.3/0.35 0.7/0.80 1/1.0':"
-            "g='0/0 0.3/0.30 0.7/0.72 1/0.92':"
-            "b='0/0 0.3/0.20 0.7/0.55 1/0.78',"  # warm orange energy
-            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.7"
-        ),
-        "video_queries": [
-            "athlete training gym intense", "runner marathon sunrise",
-            "person climbing mountain", "winner podium celebration",
-            "bodybuilder workout sweat", "sunrise horizon epic",
-            "boxing training fight", "marathon finish line",
-        ],
-    },
-    "conspiracy": {
-        "color": "#9B59B6", "glow": "#C285E0", "bg": "#070713",
-        "color_grade": (
-            "curves=r='0/0 0.3/0.25 0.7/0.65 1/0.85':"
-            "g='0/0 0.3/0.22 0.7/0.58 1/0.80':"
-            "b='0/0.04 0.3/0.35 0.7/0.70 1/0.95',"  # dark purple mystery
-            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.9"
-        ),
-        "video_queries": [
-            "government building shadows", "cctv surveillance camera",
-            "secret document papers", "person shadows mystery",
-            "eye surveillance dramatic", "underground tunnel dark",
-            "newspaper headlines dramatic", "shadow figure silhouette",
-        ],
-    },
-    "learn": {
-        "color": "#1ABC9C", "glow": "#4DDFC4", "bg": "#0D1B2A",
-        "color_grade": (
-            "curves=r='0/0 0.3/0.28 0.7/0.72 1/0.93':"
-            "g='0/0 0.3/0.32 0.7/0.75 1/0.97':"
-            "b='0/0.02 0.3/0.33 0.7/0.70 1/0.92',"  # clean teal academic
-            "unsharp=luma_msize_x=3:luma_msize_y=3:luma_amount=0.5"
-        ),
-        "video_queries": [
-            "student studying library", "books open knowledge",
-            "science experiment lab", "technology innovation future",
-            "whiteboard teaching class", "person reading focus",
-            "coding computer screen", "universe stars learning",
-        ],
-    },
-    # ── BALL FIGHT (physics-sim niche — no stock footage, self-rendered) ──
     "ballfight": {
         "color": "#39FF14", "glow": "#8CFF66", "bg": "#04050A",
         "color_grade": (
@@ -214,18 +48,9 @@ NICHES = {
             "b='0/0 0.4/0.35 0.8/0.70 1/0.90',"  # punchy neon arcade look
             "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.8"
         ),
-        "video_queries": [],  # unused — ballfight renders its own physics footage
     },
 }
 
-# Niches eligible for the classic stock-footage/YouTube pipeline.
-# "ballfight" is excluded — it has its own generation + upload path (TikTok).
-STOCKFOOTAGE_NICHES = [k for k in NICHES if k != "ballfight"]
-
-
-# ══════════════════════════════════════════════════════════════════════
-# FONT BOOTSTRAP
-# ══════════════════════════════════════════════════════════════════════
 
 def ensure_font() -> str:
     """Download Impact/Montserrat Black font if not present."""
@@ -267,106 +92,6 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
 
 # ══════════════════════════════════════════════════════════════════════
 # STEP 1 — SCRIPT (aggressive viral prompts)
-# ══════════════════════════════════════════════════════════════════════
-
-def generate_script(niche: str) -> dict:
-    """
-    Script generation tuned to 2026 viral-format research:
-    - Outcome/result-first hooks (or Question/Why-How — both top performers)
-    - Third-person narration (narrate, don't star)
-    - FAST CUT PACING: many short scenes (2.5-4.5s each) even though total
-      runtime stays 80-95s for monetization — this mimics the rapid scene-
-      change rhythm of actually-viral Shorts instead of slow 5-6s scenes
-    - 8-12 hashtags generated as part of the script (5-8 niche + 2-4 generic)
-    - Mid-video "re-hooks" every ~15-20s to fight drop-off on longer videos
-    """
-    client = Groq(api_key=os.environ["GROQ_API_KEY"])
-
-    hook_styles = [
-        "OUTCOME-FIRST: open by showing/stating the shocking result or fact "
-        "immediately — viewer must know the payoff within 2 seconds",
-        "QUESTION/WHY-HOW: open with a sharp specific question the viewer "
-        "needs answered ('Why does X happen?', 'How is X even possible?')",
-        "CONTRARIAN: open by contradicting a widely-held belief ('Everyone "
-        "thinks X. They're wrong.')",
-    ]
-    chosen_hook = random.choice(hook_styles)
-
-    system = (
-        "You are a viral YouTube Shorts / TikTok scriptwriter optimized for "
-        "2026 platform research data. Return ONLY valid JSON, no markdown, "
-        "no preamble. "
-        "Format: {title, hook, hashtags: [string], scenes: [{text, duration, pexels_query}]} "
-        ""
-        "HOOK RULE — use this exact style for the opening line: "
-        f"{chosen_hook} "
-        ""
-        "PACING RULE (critical — this is what separates viral from flat): "
-        "- Generate 20-26 scenes minimum "
-        "- EACH scene is 2.5-4.5 seconds, ONE short punchy sentence or fragment "
-        "- Never let two consecutive scenes run long — vary rhythm like a "
-        "real edit: short-short-medium-short "
-        "- Total spoken duration must sum to 80-95 seconds "
-        "- Every 4-5 scenes, insert a mini cliffhanger or re-hook line "
-        "('But here's the part nobody talks about...', 'And it gets weirder...') "
-        "to fight viewer drop-off across the longer runtime "
-        ""
-        "NARRATION RULE: third-person narrator voice — describe the fact/story, "
-        "never 'I' or personal anecdotes, like a documentary voiceover "
-        ""
-        "HASHTAG RULE: generate exactly 8-12 hashtags — 5-8 specific to the "
-        "niche/topic content, 2-4 generic high-traffic tags (#shorts #fyp "
-        "#viral #trending) "
-        ""
-        "pexels_query: 3-word visual search term per scene for stock footage"
-    )
-    # Load patterns from previous viral video analysis (free Groq Vision)
-    patterns     = load_viral_patterns()
-    pattern_hint = patterns_to_prompt_hints(patterns, niche)
-
-    prompt = (
-        f"Write a viral {niche} YouTube Shorts script. "
-        "Make it genuinely surprising, controversial or emotionally charged — "
-        "something people will want to comment on or share. "
-        "Fast pacing, short scenes, frequent re-hooks. "
-        "This must feel like a tightly-edited 80+ second video, not a slow one."
-        + (f"\n\n{pattern_hint}" if pattern_hint else "")
-    )
-
-    for attempt in range(5):
-        try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": system},
-                          {"role": "user",   "content": prompt}],
-                temperature=0.95, max_tokens=3000,
-            )
-            raw  = resp.choices[0].message.content.strip()
-            raw  = raw.strip("```json").strip("```").strip()
-            data = json.loads(raw)
-
-            n_scenes  = len(data.get("scenes", []))
-            total_dur = sum(float(s.get("duration", 0)) for s in data.get("scenes", []))
-            hashtags  = data.get("hashtags", [])
-
-            if n_scenes >= MIN_SCENES and total_dur >= 60:
-                log.info(
-                    "Script OK: %d scenes, %.0fs, %d hashtags — \"%s\"",
-                    n_scenes, total_dur, len(hashtags), data.get("title", "")
-                )
-                return data
-            log.warning(
-                "Script rejected (scenes=%d, dur=%.0fs) — retrying…",
-                n_scenes, total_dur
-            )
-        except Exception as e:
-            log.warning("Script attempt %d: %s", attempt + 1, e)
-        time.sleep(2 ** attempt)
-    raise RuntimeError("Script generation failed after 5 attempts")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 2 — VOICEOVER (ElevenLabs → OpenAI → edge-tts)
 # ══════════════════════════════════════════════════════════════════════
 
 def _elevenlabs_tts(text: str, path: str) -> bool:
@@ -513,1568 +238,351 @@ def generate_voiceover(text: str, path: str) -> None:
 # STEP 3 — ASSEMBLYAI TRANSCRIPTION (raw HTTP)
 # ══════════════════════════════════════════════════════════════════════
 
-def transcribe_with_assemblyai(audio_path: str) -> dict:
-    key = os.environ["ASSEMBLYAI_API_KEY"]
-    hdr = {"authorization": key}
-
-    log.info("Uploading to AssemblyAI…")
-    with open(audio_path, "rb") as f:
-        up = requests.post("https://api.assemblyai.com/v2/upload",
-                           headers=hdr, data=f, timeout=60)
-    up.raise_for_status()
-    audio_url = up.json()["upload_url"]
-
-    sub = requests.post(
-        "https://api.assemblyai.com/v2/transcript",
-        headers={**hdr, "content-type": "application/json"},
-        json={"audio_url": audio_url, "speech_models": ["universal-2"],
-              "punctuate": True, "format_text": True, "disfluencies": False},
-        timeout=30,
-    )
-    sub.raise_for_status()
-    tid = sub.json()["id"]
-
-    poll = f"https://api.assemblyai.com/v2/transcript/{tid}"
-    for i in range(120):
-        time.sleep(3)
-        r = requests.get(poll, headers=hdr, timeout=10).json()
-        if r["status"] == "completed": break
-        if r["status"] == "error":     raise RuntimeError(f"AAI: {r.get('error')}")
-        if i % 10 == 0: log.info("AAI polling… %ds", i*3)
-
-    words = [{"text": w["text"], "start_ms": w["start"],
-              "end_ms": w["end"], "confidence": w.get("confidence",1.0)}
-             for w in (r.get("words") or [])]
-
-    # Build utterances from punctuation
-    utterances, cur = [], []
-    for w in words:
-        cur.append(w)
-        if w["text"].rstrip().endswith((".", "!", "?")):
-            utterances.append({"text": " ".join(x["text"] for x in cur),
-                                "start_ms": cur[0]["start_ms"],
-                                "end_ms":   cur[-1]["end_ms"]})
-            cur = []
-    if cur:
-        utterances.append({"text": " ".join(x["text"] for x in cur),
-                            "start_ms": cur[0]["start_ms"],
-                            "end_ms":   cur[-1]["end_ms"]})
-
-    pauses = [{"start_ms": utterances[i]["end_ms"],
-               "end_ms":   utterances[i+1]["start_ms"]}
-              for i in range(len(utterances)-1)
-              if utterances[i+1]["start_ms"] - utterances[i]["end_ms"] >= 200]
-
-    total_ms = words[-1]["end_ms"] if words else 0
-    log.info("AAI: %d words, %d utterances, %d pauses (%.1fs)",
-             len(words), len(utterances), len(pauses), total_ms/1000)
-    return {"words": words, "utterances": utterances,
-            "pauses": pauses, "total_ms": total_ms}
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 4 — SMART CUT POINTS (pydub + AAI)
-# ══════════════════════════════════════════════════════════════════════
-
-def detect_cut_points(audio_path: str, aai_data: dict, n_scenes: int,
-                      silence_thresh_db: int = -40,
-                      min_silence_ms: int = 300) -> list[float]:
-    """
-    Returns n_scenes-1 cut points (seconds), prioritizing real silence/
-    pauses but FILLING IN additional cuts snapped to word-end boundaries
-    when natural pauses aren't enough to support the target scene count.
-
-    Without this fallback, a script with e.g. 22 scenes but only 5 real
-    pauses would collapse down to 6 giant scenes — defeating the entire
-    point of fast viral-style cut pacing.
-    """
-    audio    = AudioSegment.from_file(audio_path)
-    total_ms = len(audio)
-    words    = aai_data.get("words", [])
-
-    # ── 1. "Hard" cuts — real silence/pauses (highest quality) ────────
-    pydub_mids = [(s+e)//2 for s,e in
-                  detect_silence(audio, min_silence_len=min_silence_ms,
-                                 silence_thresh=silence_thresh_db)]
-    aai_mids   = [(p["start_ms"]+p["end_ms"])//2
-                  for p in aai_data.get("pauses", [])]
-
-    hard, last = [], -9999
-    for t in sorted(set(pydub_mids + aai_mids)):
-        if t - last > 500 and 3000 < t < total_ms - 3000:
-            hard.append(t)
-            last = t
-
-    n_cuts = n_scenes - 1
-    log.info("Natural pause candidates: %d (need %d cuts)", len(hard), n_cuts)
-
-    if len(hard) >= n_cuts:
-        # Plenty of real pauses — pick the ones closest to even spacing
-        ideal = total_ms / n_scenes
-        pool, chosen = hard.copy(), []
-        for i in range(1, n_scenes):
-            target  = i * ideal
-            closest = min(pool, key=lambda t: abs(t-target))
-            chosen.append(closest)
-            pool.remove(closest)
-        result = sorted(t/1000.0 for t in chosen)
-        log.info("Cut points (%d, all natural): %s",
-                 len(result), [f"{c:.1f}s" for c in result])
-        return result
-
-    # ── 2. Not enough natural pauses — fill gaps with word-boundary cuts ─
-    # Build a sorted list of every word-end timestamp as a fallback
-    # candidate. These are never mid-word (they're exactly where one
-    # word finishes), so audio never gets cut inside a syllable.
-    word_ends = sorted(w["end_ms"] for w in words
-                       if 3000 < w["end_ms"] < total_ms - 3000)
-
-    ideal    = total_ms / n_scenes
-    targets  = [i * ideal for i in range(1, n_scenes)]
-    chosen   = []
-    used_hard, used_words = set(), set()
-
-    for target in targets:
-        # Prefer a natural pause near this target position
-        nearby_hard = [t for t in hard if t not in used_hard
-                      and abs(t - target) < ideal * 0.5]
-        if nearby_hard:
-            pick = min(nearby_hard, key=lambda t: abs(t-target))
-            used_hard.add(pick)
-            chosen.append(pick)
-            continue
-        # Otherwise snap to the nearest unused word-end boundary
-        candidates = [w for w in word_ends if w not in used_words]
-        if candidates:
-            pick = min(candidates, key=lambda t: abs(t-target))
-            used_words.add(pick)
-            chosen.append(pick)
-
-    result = sorted(set(t/1000.0 for t in chosen))
-    log.info("Cut points (%d, %d natural + %d word-snapped): %s",
-             len(result), len(used_hard), len(used_words),
-             [f"{c:.1f}s" for c in result])
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 5 — PEXELS VIDEO BACKGROUNDS (NEW — replaces static images)
-# ══════════════════════════════════════════════════════════════════════
-
-_pexels_video_cache: dict = {}
-
-# ══════════════════════════════════════════════════════════════════════
-# GROQ-POWERED SMART PEXELS QUERY (free — Groq has no cost)
-#
-#  Instead of using the generic 3-word pexels_query from the script,
-#  this function uses Groq to analyze the scene text + niche and
-#  generate the most visually specific search term possible.
-#  Falls back to the niche's rotating video_queries pool instantly
-#  if Groq is unavailable, so zero extra latency risk.
-# ══════════════════════════════════════════════════════════════════════
-
-_groq_query_cache: dict = {}
-
-def smart_pexels_query(scene_text: str, niche: str,
-                       fallback_query: str = "") -> str:
-    """
-    Use Groq to generate the most visually relevant Pexels search query
-    for a given scene. Caches results to avoid duplicate API calls.
-    Falls back to niche rotation pool if Groq fails.
-    """
-    cache_key = scene_text[:60]
-    if cache_key in _groq_query_cache:
-        return _groq_query_cache[cache_key]
-
-    # Niche fallback pool — always available instantly
-    pool = NICHES[niche].get("video_queries", ["cinematic nature landscape"])
-    niche_fallback = random.choice(pool)
-
-    groq_key = os.getenv("GROQ_API_KEY")
-    if not groq_key:
-        return niche_fallback
-
-    try:
-        client = Groq(api_key=groq_key)
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{
-                "role": "system",
-                "content": (
-                    "You are a video director. Given a short script line and a niche, "
-                    "output ONLY a 3-5 word Pexels video search query that would find "
-                    "the most visually striking, emotionally relevant portrait-oriented "
-                    "footage to play behind this voiceover. "
-                    "No explanation. No punctuation. Just the search query."
-                )
-            }, {
-                "role": "user",
-                "content": f"Niche: {niche}\nLine: {scene_text}\nQuery:"
-            }],
-            temperature=0.7,
-            max_tokens=20,
-        )
-        query = resp.choices[0].message.content.strip().strip('"').strip("'")
-        if 2 <= len(query.split()) <= 6:
-            _groq_query_cache[cache_key] = query
-            log.info("Smart query: '%s' → '%s'", scene_text[:40], query)
-            return query
-    except Exception as e:
-        log.debug("Smart query failed: %s — using pool fallback", e)
-
-    _groq_query_cache[cache_key] = niche_fallback
-    return niche_fallback
-
-
-def fetch_pexels_video(query: str, min_dur: float = 4.0,
-                       download: bool = False) -> Optional[str]:
-    """
-    Fetch a Pexels portrait video for a query.
-    download=False (default): returns the direct CDN URL (for Creatomate).
-    download=True: downloads to /tmp and returns local path (for MoviePy).
-    """
-    key = os.getenv("PEXELS_KEY")
-    if not key:
-        return None
-
-    cache_key = f"{query.lower()[:30]}_{download}"
-    if cache_key in _pexels_video_cache:
-        return _pexels_video_cache[cache_key]
-
-    try:
-        r = requests.get(
-            "https://api.pexels.com/videos/search",
-            headers={"Authorization": key},
-            params={"query": query, "per_page": 15,
-                    "orientation": "portrait", "size": "medium"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        videos = r.json().get("videos", [])
-        good   = [v for v in videos if v.get("duration", 0) >= min_dur] or videos
-        if not good:
-            return None
-
-        video  = random.choice(good)
-        files  = sorted(video.get("video_files", []),
-                        key=lambda f: f.get("height", 0) or 0, reverse=True)
-        best   = next((f for f in files if (f.get("height") or 0) >= 1080), files[0])
-        url    = best["link"]
-
-        if not download:
-            _pexels_video_cache[cache_key] = url
-            log.info("Pexels URL: '%s' → %s", query, url[:60])
-            return url
-
-        # Download for local MoviePy fallback
-        tmp_p = f"/tmp/pex_{video['id']}.mp4"
-        if not Path(tmp_p).exists():
-            data = requests.get(url, timeout=60, stream=True)
-            with open(tmp_p, "wb") as f:
-                for chunk in data.iter_content(1024*1024): f.write(chunk)
-        _pexels_video_cache[cache_key] = tmp_p
-        log.info("Pexels download: '%s' → %s", query, tmp_p)
-        return tmp_p
-
-    except Exception as e:
-        log.warning("Pexels failed for '%s': %s", query, e)
-        return None
-
-
-def make_solid_bg_clip(color_hex: str, duration: float) -> VideoFileClip:
-    """Fallback: solid color clip when Pexels unavailable."""
-    r, g, b = tuple(int(color_hex.lstrip("#")[i:i+2], 16) for i in (0,2,4))
-    arr     = np.full((VIDEO_H, VIDEO_W, 3), [r,g,b], dtype=np.uint8)
-    clip    = ImageClip(arr).with_duration(duration).with_fps(FPS)
-    return clip
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 6 — WORD-BY-WORD ANIMATED CAPTIONS  (viral MrBeast style)
-#
-#  Groups words into chunks of CAPTION_WORDS.
-#  Each chunk becomes an ImageClip overlay timed to the audio.
-#  Current chunk: accent color + scale-up.  Rest: white.
-#  All text: bold, black stroke, center screen at ~60% height.
-# ══════════════════════════════════════════════════════════════════════
-
 def _hex(h: str) -> tuple:
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0,2,4))
-
-
-def render_caption_frame(
-    chunk_words:   list[str],
-    active_idx:    int,        # which word in chunk is currently spoken
-    accent_color:  str,
-    frame_w:       int = VIDEO_W,
-    frame_h:       int = VIDEO_H,
-) -> Image.Image:
-    """
-    Renders one caption frame: chunk of words, active word in accent color.
-    Returns RGBA image (transparent outside text area).
-    """
-    frame = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
-    draw  = ImageDraw.Draw(frame)
-    font  = load_font(CAPTION_FONT_SIZE)
-    ac    = _hex(accent_color)
-
-    line  = " ".join(chunk_words)
-    bb    = draw.textbbox((0, 0), line, font=font)
-    lw    = bb[2] - bb[0]
-    lh    = bb[3] - bb[1]
-    x0    = (frame_w - lw) // 2
-    y0    = int(frame_h * 0.60)
-
-    # Measure each word individually for per-word coloring
-    x_cur = x0
-    for i, word in enumerate(chunk_words):
-        wb    = draw.textbbox((0, 0), word, font=font)
-        ww    = wb[2] - wb[0]
-        space = draw.textbbox((0, 0), " ", font=font)
-        sw    = space[2] - space[0]
-
-        # Black outline / stroke (4px in 8 directions)
-        for dx, dy in [(-4,0),(4,0),(0,-4),(0,4),(-3,-3),(3,-3),(-3,3),(3,3)]:
-            draw.text((x_cur+dx, y0+dy), word, font=font, fill=(0,0,0,255))
-
-        # Word color: accent if active, white otherwise
-        color = (*ac, 255) if i == active_idx else (255,255,255,255)
-        draw.text((x_cur, y0), word, font=font, fill=color)
-
-        x_cur += ww + sw
-
-    return frame
-
-
-def build_caption_clips(aai_data: dict, niche: str, total_dur: float) -> list:
-    """
-    Returns list of (ImageClip, start_time) tuples for all word chunks.
-    Each clip is a transparent RGBA overlay timed to spoken words.
-    """
-    words   = aai_data.get("words", [])
-    if not words:
-        return []
-    accent  = NICHES[niche]["color"]
-    clips   = []
-    i       = 0
-
-    while i < len(words):
-        chunk = words[i : i + CAPTION_WORDS]
-        if not chunk:
-            break
-        chunk_texts  = [w["text"] for w in chunk]
-        chunk_start  = chunk[0]["start_ms"] / 1000.0
-        chunk_end    = chunk[-1]["end_ms"]   / 1000.0
-        chunk_dur    = max(chunk_end - chunk_start, 0.15)
-
-        # For each word in chunk, figure out its sub-timing
-        # We render one frame per word that is "active" inside the chunk
-        for j, word in enumerate(chunk):
-            w_start = word["start_ms"] / 1000.0
-            w_end   = word["end_ms"]   / 1000.0
-            w_dur   = max(w_end - w_start, 0.08)
-
-            img  = render_caption_frame(chunk_texts, j, accent)
-            arr  = np.array(img)
-            clip = (ImageClip(arr, is_mask=False)
-                    .with_duration(w_dur)
-                    .with_fps(FPS))
-            clips.append((clip, w_start))
-
-        i += CAPTION_WORDS
-
-    log.info("Caption clips built: %d word segments", len(clips))
-    return clips
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 7 — SFX & MUSIC BOOTSTRAP
-# ══════════════════════════════════════════════════════════════════════
-
-def _synth_whoosh(path: str) -> None:
-    sr, dur = 44100, 0.28
-    n = int(sr*dur)
-    t = np.linspace(0,dur,n)
-    freq = np.exp(np.linspace(np.log(3200),np.log(180),n))
-    phase = np.cumsum(2*np.pi*freq/sr)
-    env = np.exp(-4*t/dur)
-    wave = (np.sin(phase)*env*26000).astype(np.int16)
-    AudioSegment(wave.tobytes(),frame_rate=sr,sample_width=2,channels=1).fade_out(60).export(path,format="mp3")
-
-def _synth_impact(path: str) -> None:
-    sr,n = 44100, int(44100*0.12)
-    noise = np.random.uniform(-1,1,n)
-    b,a = scipy.signal.butter(4,700/(sr/2),btype="low")
-    f = scipy.signal.lfilter(b,a,noise)
-    dec = np.exp(-np.linspace(0,9,n))
-    wave = (f*dec*30000).astype(np.int16)
-    AudioSegment(wave.tobytes(),frame_rate=sr,sample_width=2,channels=1).fade_out(40).export(path,format="mp3")
-
-def _synth_ambient(path: str, dur_s: float = 120) -> None:
-    sr = 44100; n = int(sr*dur_s); t = np.linspace(0,dur_s,n)
-    wave = (0.30*np.sin(2*np.pi*110*t)+0.22*np.sin(2*np.pi*165*t)+
-            0.16*np.sin(2*np.pi*220*t)+0.10*np.sin(2*np.pi*262*t)+
-            0.07*np.sin(2*np.pi*330*t))
-    wave *= (0.72+0.28*np.sin(2*np.pi*0.4*t))
-    wave  = wave/(np.max(np.abs(wave))+1e-9)*22000
-    seg   = AudioSegment(wave.astype(np.int16).tobytes(),frame_rate=sr,sample_width=2,channels=1)
-    seg.fade_in(2000).fade_out(2000).export(path,format="mp3")
-    log.info("Ambient pad synthesised (%.0fs)",dur_s)
-
-def ensure_music(duration_s: float = 120) -> str:
-    if Path(MUSIC_PATH).exists():
-        return MUSIC_PATH
-    if PIXABAY_KEY:
-        for q in ("cinematic background","lofi ambient","dark dramatic"):
-            try:
-                r = requests.get("https://pixabay.com/api/videos/music/",
-                                 params={"key":PIXABAY_KEY,"q":q,"per_page":5},timeout=10)
-                hits = r.json().get("hits",[])
-                if hits:
-                    url  = random.choice(hits)["audio"]["url"]
-                    data = requests.get(url,timeout=30).content
-                    Path(MUSIC_PATH).write_bytes(data)
-                    log.info("Pixabay music: '%s'",q)
-                    return MUSIC_PATH
-            except Exception as e:
-                log.warning("Pixabay: %s",e)
-    _synth_ambient(MUSIC_PATH, duration_s+10)
-    return MUSIC_PATH
-
-def ensure_sfx() -> tuple[str,str]:
-    if not Path(SFX_WHOOSH).exists(): _synth_whoosh(SFX_WHOOSH)
-    if not Path(SFX_IMPACT).exists(): _synth_impact(SFX_IMPACT)
-    return SFX_WHOOSH, SFX_IMPACT
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 8 — CREATOMATE CLOUD RENDER  (PRIMARY render engine)
-#
-#  This is the "external Schnitt-KI" — Creatomate handles:
-#   • Ken Burns zoom per scene (scale animation)
-#   • Crossfade transitions between scenes
-#   • Word-appear text animations
-#   • AUTO-TRANSCRIPT viral captions (transcript_effect: highlight)
-#     → transcribes the voiceover itself and renders word-by-word
-#       highlighted captions, the exact MrBeast/TikTok style
-#   • Progress bar per scene
-#   • Ducked background music
-#
-#  Falls back to local MoviePy render if CREATOMATE_API_KEY not set
-#  or if the API call fails for any reason.
-# ══════════════════════════════════════════════════════════════════════
-
-def _upload_to_cdn(file_path: str) -> Optional[str]:
-    """
-    Upload a file to 0x0.st (free, no API key) and return its public URL.
-    Creatomate needs publicly reachable URLs for audio/video sources.
-    """
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://0x0.st", files={"file": f}, timeout=60)
-        url = r.text.strip()
-        if url.startswith("http"):
-            log.info("CDN upload OK: %s", url)
-            return url
-        log.warning("CDN upload returned unexpected response: %s", url[:100])
-    except Exception as e:
-        log.warning("CDN upload failed: %s", e)
-    return None
-
-
-def creatomate_render(
-    scenes:      list[dict],
-    audio_path:  str,
-    niche:       str,
-    output_path: str,
-    music_path:  str = "",
-) -> Optional[str]:
-    """
-    Full Creatomate JSON-to-video render.
-    Returns output_path on success, None to trigger MoviePy fallback.
-    """
-    api_key = os.getenv("CREATOMATE_API_KEY")
-    if not api_key:
-        log.info("CREATOMATE_API_KEY not set — using local MoviePy render")
-        return None
-
-    cfg = NICHES[niche]
-    ac  = cfg["color"]
-
-    # ── 1. Upload voiceover to CDN (Creatomate needs a public URL) ────
-    audio_url = _upload_to_cdn(audio_path)
-    if not audio_url:
-        log.warning("Creatomate: voice CDN upload failed — falling back")
-        return None
-
-    # ── 2. Build per-scene elements ────────────────────────────────────
-    elements = []
-    t_cursor = 0.0
-
-    for i, scene in enumerate(scenes):
-        dur  = float(scene.get("duration", 5))
-        text = scene.get("text", "")
-        q    = scene.get("pexels_query", text[:40])
-
-        q = smart_pexels_query(scene.get("text",""), niche, fallback_query=q)
-        vid_url = fetch_pexels_video(q, min_dur=dur, download=False)
-        if vid_url:
-            anims = [{
-                "type": "scale", "scope": "element",
-                "easing": "linear", "from": "100%", "to": "108%",
-            }]
-            if i > 0:
-                anims.append({
-                    "type": "fade", "scope": "element",
-                    "easing": "linear", "duration": TRANSITION_DUR,
-                })
-            elements.append({
-                "type":     "video",
-                "id":       f"bg-{i}",
-                "source":   vid_url,
-                "time":     round(t_cursor, 3),
-                "duration": round(dur, 3),
-                "volume":   0,
-                "fit":      "cover",
-                "animations": anims,
-            })
-
-        # Dark overlay for caption readability
-        elements.append({
-            "type": "shape", "shape_type": "rectangle",
-            "time": round(t_cursor, 3), "duration": round(dur, 3),
-            "width": "100%", "height": "100%",
-            "fill_color": "rgba(0,0,0,0.42)",
-        })
-
-        # Scene headline text (word-appear)
-        elements.append({
-            "type":          "text",
-            "value":         text,
-            "time":          round(t_cursor, 3),
-            "duration":      round(dur, 3),
-            "y":             "62%",
-            "width":         "88%",
-            "height":        "28%",
-            "x_alignment":   "50%",
-            "y_alignment":   "0%",
-            "font_family":   "Montserrat",
-            "font_weight":   "900",
-            "font_size":     "7.5 vmin",
-            "fill_color":    "#FFFFFF",
-            "stroke_color":  "#000000",
-            "stroke_width":  "1.2 vmin",
-            "animations": [{
-                "type": "text-appear", "scope": "split", "split": "word",
-                "easing": "back-out", "duration": min(0.4, dur * 0.15),
-            }],
-        })
-
-        # Per-scene progress bar
-        progress = (i + 1) / len(scenes)
-        elements.append({
-            "type": "shape", "shape_type": "rectangle",
-            "time": round(t_cursor, 3), "duration": round(dur, 3),
-            "width": f"{progress*100:.1f}%", "height": "0.6%",
-            "x": "0%", "y": "99%",
-            "x_alignment": "0%", "y_alignment": "100%",
-            "fill_color": ac,
-        })
-
-        t_cursor += dur
-
-    # ── 3. Voiceover audio track ───────────────────────────────────────
-    voice_id = "voiceover-audio"
-    elements.append({
-        "type": "audio", "id": voice_id, "source": audio_url,
-        "time": 0, "duration": round(t_cursor, 3), "volume": "100%",
-    })
-
-    # ── 4. AUTO-TRANSCRIPT viral captions (Creatomate transcribes itself) ─
-    elements.append({
-        "type":                       "text",
-        "transcript_source":          voice_id,
-        "transcript_effect":          "highlight",
-        "transcript_color":           ac,
-        "transcript_maximum_length":  12,
-        "time":                       0,
-        "duration":                   round(t_cursor, 3),
-        "y":                          "82%",
-        "width":                      "84%",
-        "height":                     "14%",
-        "x_alignment":                "50%",
-        "y_alignment":                "50%",
-        "font_family":                "Montserrat",
-        "font_weight":                "700",
-        "font_size":                  "8.5 vmin",
-        "fill_color":                 "#FFFFFF",
-        "stroke_color":               "#000000",
-        "stroke_width":               "1.5 vmin",
-    })
-
-    # ── 5. Background music (ducked) ───────────────────────────────────
-    mp = music_path or MUSIC_PATH
-    if Path(mp).exists():
-        music_url = _upload_to_cdn(mp)
-        if music_url:
-            elements.append({
-                "type": "audio", "source": music_url,
-                "time": 0, "duration": round(t_cursor, 3), "volume": "12%",
-            })
-
-    # ── 6. Submit render job ───────────────────────────────────────────
-    payload = {
-        "output_format": "mp4",
-        "width":  VIDEO_W,
-        "height": VIDEO_H,
-        "frame_rate": FPS,
-        "elements": elements,
-    }
-    headers = {"Authorization": f"Bearer {api_key}",
-               "Content-Type":  "application/json"}
-
-    log.info("Creatomate: submitting %d elements, %.0fs total…",
-             len(elements), t_cursor)
-    r = requests.post("https://api.creatomate.com/v1/renders",
-                      headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        log.error("Creatomate submit failed (%d): %s", r.status_code, r.text[:300])
-        return None
-
-    render = r.json()
-    if isinstance(render, list):
-        render = render[0]
-    render_id = render["id"]
-    log.info("Creatomate render ID: %s", render_id)
-
-    # ── 7. Poll until done ──────────────────────────────────────────────
-    poll_url = f"https://api.creatomate.com/v1/renders/{render_id}"
-    for attempt in range(120):
-        time.sleep(5)
-        sr     = requests.get(poll_url, headers=headers, timeout=15).json()
-        status = sr.get("status", "")
-        if attempt % 6 == 0:
-            log.info("Creatomate status: %s (%ds elapsed)", status, attempt*5)
-        if status == "succeeded":
-            video_url = sr["url"]
-            data = requests.get(video_url, timeout=180).content
-            Path(output_path).write_bytes(data)
-            log.info("Creatomate render complete: %s (%.1fMB)",
-                     output_path, len(data)/1e6)
-            return output_path
-        if status in ("failed", "error"):
-            log.error("Creatomate render failed: %s", sr.get("error", ""))
-            return None
-
-    log.error("Creatomate timeout")
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 8b — GOOGLE DRIVE CDN UPLOAD
-#   Uploads audio/assets to Google Drive and returns a public URL.
-#   Used by JSON2Video and Shotstack which need public URLs.
-#   Requires YouTube OAuth token (already in YOUTUBE_TOKEN_B64) —
-#   the same account has Drive access on the same token.
-# ══════════════════════════════════════════════════════════════════════
-
-def drive_cdn_upload(file_path: str, filename: str) -> Optional[str]:
-    """
-    Upload a file to Google Drive 'VaultMind/cdn' folder,
-    set it to public, and return the direct download URL.
-    Falls back to 0x0.st CDN if Drive upload fails.
-    """
-    try:
-        from googleapiclient.discovery import build as gb
-        token_b64  = os.getenv("YOUTUBE_TOKEN_B64")
-        if not token_b64:
-            raise ValueError("No token")
-        creds_data = pickle.loads(base64.b64decode(token_b64))
-        if isinstance(creds_data, Credentials):
-            creds = creds_data
-        elif isinstance(creds_data, str):
-            creds = Credentials.from_authorized_user_info(json.loads(creds_data))
-        else:
-            creds = Credentials.from_authorized_user_info(creds_data)
-
-        drive = gb("drive", "v3", credentials=creds)
-
-        # Find or create VaultMind/cdn folder
-        def find_or_create_folder(name, parent_id=None):
-            q = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            if parent_id:
-                q += f" and '{parent_id}' in parents"
-            res = drive.files().list(q=q, fields="files(id)").execute()
-            if res.get("files"):
-                return res["files"][0]["id"]
-            meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
-            if parent_id:
-                meta["parents"] = [parent_id]
-            return drive.files().create(body=meta, fields="id").execute()["id"]
-
-        vault_id = find_or_create_folder("VaultMind")
-        cdn_id   = find_or_create_folder("cdn", vault_id)
-
-        # Upload file
-        mime = "audio/mpeg" if file_path.endswith(".mp3") else "video/mp4"
-        meta = {"name": filename, "parents": [cdn_id]}
-        media = MediaFileUpload(file_path, mimetype=mime, resumable=True)
-        f = drive.files().create(body=meta, media_body=media,
-                                  fields="id").execute()
-        fid = f["id"]
-
-        # Make public
-        drive.permissions().create(
-            fileId=fid,
-            body={"type": "anyone", "role": "reader"}
-        ).execute()
-
-        url = f"https://drive.google.com/uc?export=download&id={fid}"
-        log.info("Drive CDN: %s → %s", filename, url)
-        return url
-    except Exception as e:
-        log.warning("Drive CDN failed (%s) — using 0x0.st", e)
-        return _upload_to_cdn(file_path)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 8c — JSON2VIDEO RENDER  (FREE — 600 seconds no credit card)
-#
-#   json2video.com → free account → copy API key → JSON2VIDEO_API_KEY
-#
-#   Features used:
-#   • Portrait 1080×1920 MP4
-#   • Per-scene video elements (Pexels URLs)
-#   • Text overlays with built-in animation styles
-#   • Voiceover audio track
-#   • Auto-generated subtitles (included free)
-#   • Background music track
-# ══════════════════════════════════════════════════════════════════════
-
-def json2video_render(
-    scenes:      list[dict],
-    audio_path:  str,
-    niche:       str,
-    output_path: str,
-    music_path:  str = "",
-) -> Optional[str]:
-    api_key = os.getenv("JSON2VIDEO_API_KEY")
-    if not api_key:
-        log.info("JSON2VIDEO_API_KEY not set — skipping")
-        return None
-
-    cfg = NICHES[niche]
-    ac  = cfg["color"]
-
-    # Upload audio to CDN (Drive → 0x0.st fallback)
-    audio_url = drive_cdn_upload(audio_path, "voice.mp3")
-    if not audio_url:
-        log.warning("JSON2Video: audio CDN failed")
-        return None
-
-    # Build scenes array
-    j2v_scenes = []
-    for i, scene in enumerate(scenes):
-        dur  = float(scene.get("duration", 5))
-        text = scene.get("text", "")
-        q    = scene.get("pexels_query", text[:40])
-
-        elements = []
-
-        # Background video from Pexels
-        q = smart_pexels_query(scene.get("text",""), niche, fallback_query=q)
-        vid_url = fetch_pexels_video(q, min_dur=dur, download=False)
-        if vid_url:
-            elements.append({
-                "type":     "video",
-                "src":      vid_url,
-                "duration": int(dur * 1000),  # ms
-                "volume":   0,
-            })
-        else:
-            # Solid color background fallback
-            elements.append({
-                "type":       "rectangle",
-                "width":      "100%",
-                "height":     "100%",
-                "background": cfg["bg"],
-                "duration":   int(dur * 1000),
-            })
-
-        # Dark overlay
-        elements.append({
-            "type":       "rectangle",
-            "width":      "100%",
-            "height":     "100%",
-            "background": "rgba(0,0,0,0.40)",
-            "duration":   int(dur * 1000),
-        })
-
-        # Scene text
-        elements.append({
-            "type":       "text",
-            "text":       text,
-            "duration":   int(dur * 1000),
-            "x":          "center",
-            "y":          "62%",
-            "width":      "88%",
-            "font-size":  72,
-            "font-family":"Montserrat",
-            "font-weight":"900",
-            "color":      "#FFFFFF",
-            "stroke":     "#000000",
-            "stroke-width": 8,
-            "style":      "004",    # built-in word-reveal animation
-        })
-
-        # Progress bar
-        prog_w = int(1080 * (i+1) / len(scenes))
-        elements.append({
-            "type":       "rectangle",
-            "x":          0, "y": "99.4%",
-            "width":      prog_w,
-            "height":     12,
-            "background": ac,
-            "duration":   int(dur * 1000),
-        })
-
-        j2v_scenes.append({
-            "comment":  f"Scene {i+1}",
-            "duration": int(dur * 1000),
-            "elements": elements,
-        })
-
-    # Global audio tracks (added outside scenes)
-    global_elements = [
-        {
-            "type":     "audio",
-            "src":      audio_url,
-            "duration": int(sum(float(s.get("duration",5)) for s in scenes) * 1000),
-            "volume":   100,
-        }
-    ]
-
-    # Background music
-    mp = music_path or MUSIC_PATH
-    if Path(mp).exists():
-        music_url = drive_cdn_upload(mp, "music.mp3")
-        if music_url:
-            global_elements.append({
-                "type":     "audio",
-                "src":      music_url,
-                "duration": int(sum(float(s.get("duration",5)) for s in scenes) * 1000),
-                "volume":   12,
-            })
-
-    payload = {
-        "width":    VIDEO_W,
-        "height":   VIDEO_H,
-        "fps":      FPS,
-        "quality":  "high",
-        "exports": [{
-            "format":  "mp4",
-            "start":   0,
-        }],
-        "scenes":   j2v_scenes,
-        "elements": global_elements,
-    }
-
-    log.info("JSON2Video: submitting %d scenes…", len(j2v_scenes))
-    r = requests.post(
-        "https://api.json2video.com/v2/movies",
-        headers={"x-api-key": api_key, "Content-Type": "application/json"},
-        json=payload, timeout=30,
-    )
-    if r.status_code not in (200, 201):
-        log.error("JSON2Video submit failed (%d): %s", r.status_code, r.text[:300])
-        return None
-
-    movie_id = r.json().get("movie", {}).get("id") or r.json().get("id")
-    log.info("JSON2Video movie ID: %s", movie_id)
-
-    # Poll
-    for attempt in range(120):
-        time.sleep(5)
-        pr = requests.get(
-            f"https://api.json2video.com/v2/movies?project={movie_id}",
-            headers={"x-api-key": api_key}, timeout=15
-        )
-        status = pr.json().get("movie", {}).get("status", "")
-        if attempt % 6 == 0:
-            log.info("JSON2Video: %s (%ds)", status, attempt*5)
-        if status == "done":
-            url  = pr.json()["movie"]["exports"][0]["url"]
-            data = requests.get(url, timeout=180).content
-            Path(output_path).write_bytes(data)
-            log.info("JSON2Video render done: %.1fMB", len(data)/1e6)
-            return output_path
-        if status == "error":
-            log.error("JSON2Video error: %s", pr.json())
-            return None
-
-    log.error("JSON2Video timeout")
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 8d — SHOTSTACK RENDER  (free developer sandbox)
-#
-#   shotstack.io → sign up → API key → SHOTSTACK_API_KEY
-#   Uses stage (sandbox) endpoint — unlimited renders in sandbox.
-# ══════════════════════════════════════════════════════════════════════
-
-def shotstack_render(
-    scenes:      list[dict],
-    audio_path:  str,
-    niche:       str,
-    output_path: str,
-    music_path:  str = "",
-) -> Optional[str]:
-    api_key = os.getenv("SHOTSTACK_API_KEY")
-    if not api_key:
-        log.info("SHOTSTACK_API_KEY not set — skipping")
-        return None
-
-    cfg      = NICHES[niche]
-    ac       = cfg["color"]
-    base_url = "https://api.shotstack.io/edit/v2"
-    headers  = {"x-api-key": api_key, "Content-Type": "application/json"}
-
-    # CDN upload
-    audio_url = drive_cdn_upload(audio_path, "voice_shotstack.mp3")
-    if not audio_url:
-        log.warning("Shotstack: audio CDN failed")
-        return None
-
-    # Build timeline tracks
-    video_clips  = []
-    text_clips   = []
-    t_cursor     = 0.0
-
-    for i, scene in enumerate(scenes):
-        dur  = float(scene.get("duration", 5))
-        text = scene.get("text", "")
-        q    = scene.get("pexels_query", text[:40])
-
-        q = smart_pexels_query(scene.get("text",""), niche, fallback_query=q)
-        vid_url = fetch_pexels_video(q, min_dur=dur, download=False)
-        if vid_url:
-            video_clips.append({
-                "asset":  {"type": "video", "src": vid_url, "volume": 0},
-                "start":  round(t_cursor, 3),
-                "length": round(dur, 3),
-                "fit":    "cover",
-                "effect": "zoomIn",     # Shotstack built-in Ken Burns
-                "transition": {"in": "fade", "out": "fade"} if i > 0 else {},
-            })
-
-        text_clips.append({
-            "asset": {
-                "type":     "html",
-                "html":     f'<p style="font-family:Montserrat,Arial;font-weight:900;font-size:72px;color:#fff;text-shadow:4px 4px 8px #000;text-align:center;width:900px;word-wrap:break-word;">{text}</p>',
-                "width":    960,
-                "height":   600,
-            },
-            "start":  round(t_cursor, 3),
-            "length": round(dur, 3),
-            "position": "center",
-            "offset":   {"y": 0.12},
-            "transition": {"in": "slideUp"},
-        })
-
-        t_cursor += dur
-
-    # Audio track
-    audio_clips = [{
-        "asset":  {"type": "audio", "src": audio_url, "volume": 1},
-        "start":  0,
-        "length": round(t_cursor, 3),
-    }]
-
-    # Music
-    mp = music_path or MUSIC_PATH
-    if Path(mp).exists():
-        music_url = drive_cdn_upload(mp, "music_shotstack.mp3")
-        if music_url:
-            audio_clips.append({
-                "asset":  {"type": "audio", "src": music_url, "volume": 0.12},
-                "start":  0,
-                "length": round(t_cursor, 3),
-            })
-
-    payload = {
-        "timeline": {
-            "background": cfg["bg"],
-            "tracks": [
-                {"clips": text_clips},
-                {"clips": video_clips},
-                {"clips": audio_clips},
-            ],
-        },
-        "output": {
-            "format":      "mp4",
-            "resolution":  "1080",
-            "aspectRatio": "9:16",
-            "fps":         FPS,
-            "quality":     "high",
-        },
-    }
-
-    log.info("Shotstack: submitting %d scenes…", len(scenes))
-    r = requests.post(f"{base_url}/render", headers=headers,
-                      json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        log.error("Shotstack submit failed (%d): %s", r.status_code, r.text[:300])
-        return None
-
-    render_id = r.json().get("response", {}).get("id")
-    log.info("Shotstack render ID: %s", render_id)
-
-    for attempt in range(120):
-        time.sleep(5)
-        sr     = requests.get(f"{base_url}/render/{render_id}",
-                              headers=headers, timeout=15).json()
-        status = sr.get("response", {}).get("status", "")
-        if attempt % 6 == 0:
-            log.info("Shotstack: %s (%ds)", status, attempt*5)
-        if status == "done":
-            url  = sr["response"]["url"]
-            data = requests.get(url, timeout=180).content
-            Path(output_path).write_bytes(data)
-            log.info("Shotstack done: %.1fMB", len(data)/1e6)
-            return output_path
-        if status in ("failed", "error"):
-            log.error("Shotstack failed: %s", sr)
-            return None
-
-    log.error("Shotstack timeout")
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 9 — MOVIEPY VIDEO ASSEMBLY (local render)
-#   Scene video clips with Ken Burns + caption overlays + SFX at cuts
-# ══════════════════════════════════════════════════════════════════════
-
-def _trim_video_clip(path: str, duration: float) -> VideoFileClip:
-    """Load a Pexels video, smart-crop to 9:16, trim/loop to duration."""
-    clip = VideoFileClip(path, audio=False)
-    # Smart crop to portrait
-    cw, ch = clip.size
-    target_ratio = VIDEO_W / VIDEO_H
-    src_ratio    = cw / ch
-    if src_ratio > target_ratio:
-        new_w = int(ch * target_ratio)
-        x1    = (cw - new_w) // 2
-        clip  = clip.cropped(x1=x1, x2=x1+new_w)
-    else:
-        new_h = int(cw / target_ratio)
-        clip  = clip.cropped(y1=0, y2=new_h)
-
-    clip = clip.resized((VIDEO_W, VIDEO_H))
-
-    # Loop if clip is shorter than needed duration
-    if clip.duration < duration:
-        reps = int(np.ceil(duration / clip.duration))
-        clip = concatenate_videoclips([clip] * reps)
-
-    return clip.subclipped(0, duration)
-
-
-def _ken_burns(clip: VideoFileClip, scale_to: float = 1.07) -> VideoFileClip:
-    """Slow Ken Burns zoom on a video clip."""
-    dur = clip.duration
-    def zoom_frame(frame, t):
-        scale = 1.0 + (scale_to - 1.0) * (t / dur)
-        h, w  = frame.shape[:2]
-        new_w, new_h = int(w*scale), int(h*scale)
-        resized = np.array(Image.fromarray(frame).resize((new_w,new_h),Image.LANCZOS))
-        x0, y0 = (new_w-w)//2, (new_h-h)//2
-        return resized[y0:y0+h, x0:x0+w]
-    return clip.transform(zoom_frame)
-
-
-def build_video_moviepy(
-    scenes:          list[dict],
-    niche:           str,
-    audio_path:      str,
-    aai_data:        dict,
-    cut_points_s:    list[float],
-    output_path:     str,
-    music_path:      str = "",
-    sfx_whoosh_path: str = "",
-    sfx_impact_path: str = "",
-) -> str:
-    log.info("▶ MoviePy v4 render — %d scenes, %dx%d", len(scenes), VIDEO_W, VIDEO_H)
-    cfg = NICHES[niche]
-
-    # Scene durations from cut points
-    total_s    = aai_data["total_ms"] / 1000.0
-    bounds     = [0.0] + cut_points_s + [total_s]
-    durations  = [bounds[i+1]-bounds[i] for i in range(len(bounds)-1)]
-    while len(scenes) < len(durations): scenes.append(scenes[-1])
-    scenes = scenes[:len(durations)]
-    n      = len(scenes)
-
-    # ── Build one video clip per scene ────────────────────────────────
-    scene_clips = []
-    for idx, (scene, dur) in enumerate(zip(scenes, durations)):
-        dur = max(dur, 0.5)
-        q   = scene.get("pexels_query", scene["text"][:40])
-        # Groq generates a more visually specific search query per scene
-        q   = smart_pexels_query(scene.get("text",""), niche, fallback_query=q)
-
-        # Background: Pexels video → solid color fallback
-        vid_path = fetch_pexels_video(q, min_dur=dur)
-        if vid_path and Path(vid_path).exists():
-            try:
-                bg = _trim_video_clip(vid_path, dur)
-                bg = _ken_burns(bg)
-            except Exception as e:
-                log.warning("Video clip error (%s), using solid BG", e)
-                bg = make_solid_bg_clip(cfg["bg"], dur)
-        else:
-            bg = make_solid_bg_clip(cfg["bg"], dur)
-
-        # Dark vignette overlay (ImageClip)
-        vig_arr  = _make_vignette(dur)
-        vig_clip = ImageClip(vig_arr).with_duration(dur).with_fps(FPS)
-
-        scene_comp = CompositeVideoClip([bg, vig_clip],
-                                        size=(VIDEO_W, VIDEO_H)).with_duration(dur)
-        scene_clips.append(scene_comp)
-        log.info("  Scene %d/%d (%.1fs) — %s", idx+1, n, dur, q[:35])
-
-    # ── Crossfade transitions ─────────────────────────────────────────
-    trans = [scene_clips[0]]
-    for c in scene_clips[1:]:
-        trans.append(c.with_effects([CrossFadeIn(TRANSITION_DUR)]))
-    final = concatenate_videoclips(trans, method="compose", padding=-TRANSITION_DUR)
-    final = final.with_effects([FadeIn(FADE_IN_DUR), FadeOut(FADE_OUT_DUR)])
-
-    # ── Caption overlays (word-by-word animated) ──────────────────────
-    cap_clips = build_caption_clips(aai_data, niche, final.duration)
-    if cap_clips:
-        cap_composites = []
-        for clip, start_t in cap_clips:
-            cap_composites.append(clip.with_start(start_t))
-        final = CompositeVideoClip([final] + cap_composites,
-                                   size=(VIDEO_W, VIDEO_H))
-        log.info("Caption overlays composited (%d clips)", len(cap_clips))
-
-    # ── Audio mix ─────────────────────────────────────────────────────
-    vid_dur  = final.duration
-    voice    = AudioFileClip(audio_path).subclipped(0, min(vid_dur, total_s))
-    tracks   = [voice]
-
-    mp = music_path or MUSIC_PATH
-    if Path(mp).exists():
-        music_raw = AudioSegment.from_file(mp) + MUSIC_DUCK_DB
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            mtmp = f.name
-        music_raw.export(mtmp, format="mp3")
-        mc = AudioFileClip(mtmp)
-        if mc.duration < vid_dur:
-            mc = concatenate_audioclips(
-                [mc] * int(np.ceil(vid_dur / mc.duration)))
-        tracks.append(mc.subclipped(0, vid_dur))
-        log.info("Music mixed (%ddB duck)", MUSIC_DUCK_DB)
-
-    wp = sfx_whoosh_path or SFX_WHOOSH
-    ip = sfx_impact_path or SFX_IMPACT
-    if Path(wp).exists() and Path(ip).exists():
-        sfx_seg = AudioSegment.silent(duration=int(vid_dur*1000)+500)
-        whoosh  = AudioSegment.from_file(wp) - 5
-        impact  = AudioSegment.from_file(ip) - 3
-        sfx_seg = sfx_seg.overlay(impact, position=0)
-        for cs in cut_points_s:
-            sfx_seg = sfx_seg.overlay(whoosh, position=max(0,int(cs*1000)-130))
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            stmp = f.name
-        sfx_seg.export(stmp, format="mp3")
-        tracks.append(AudioFileClip(stmp).subclipped(0, vid_dur))
-        log.info("SFX mixed (%d cuts)", len(cut_points_s))
-
-    final = final.with_audio(CompositeAudioClip(tracks))
-
-    # ── Export ────────────────────────────────────────────────────────
-    log.info("Exporting %dx%d @ %dfps → %s", VIDEO_W, VIDEO_H, FPS, output_path)
-    final.write_videofile(
-        output_path, fps=FPS,
-        codec="libx264", audio_codec="aac",
-        temp_audiofile="tmp_audio.m4a", remove_temp=True,
-        preset="medium",
-        ffmpeg_params=["-crf","20","-movflags","+faststart",
-                       "-vf", f"scale={VIDEO_W}:{VIDEO_H}"],
-        logger=None,
-    )
-    log.info("Export complete: %s", output_path)
-    return output_path
-
-
-def _make_vignette(duration: float) -> np.ndarray:
-    """Dark gradient overlay (bottom 55%) as RGBA numpy array."""
-    img  = Image.new("RGBA", (VIDEO_W, VIDEO_H), (0,0,0,0))
-    draw = ImageDraw.Draw(img)
-    start = int(VIDEO_H * 0.38)
-    for y in range(start, VIDEO_H):
-        alpha = int(200 * ((y-start)/(VIDEO_H-start))**0.55)
-        draw.line([(0,y),(VIDEO_W,y)], fill=(0,0,0,alpha))
-    return np.array(img)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 10 — SRT EXPORT
-# ══════════════════════════════════════════════════════════════════════
-
-def export_srt(aai_data: dict, out_path: str) -> None:
-    def fmt(s):
-        h=int(s//3600); m=int((s%3600)//60); ss=s%60
-        return f"{h:02d}:{m:02d}:{ss:06.3f}".replace(".",",")
-    words  = aai_data.get("words",[])
-    lines  = []
-    i, idx = 0, 1
-    while i < len(words):
-        chunk = words[i:i+4]
-        lines += [str(idx),
-                  f"{fmt(chunk[0]['start_ms']/1000)} --> {fmt(chunk[-1]['end_ms']/1000)}",
-                  " ".join(w["text"] for w in chunk),""]
-        i += 4; idx += 1
-    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
 
 
 # ══════════════════════════════════════════════════════════════════════
 # STEP 11 — YOUTUBE UPLOAD
 # ══════════════════════════════════════════════════════════════════════
 
-def upload_youtube(video_path: str, title: str, description: str,
-                   srt_path: Optional[str] = None,
-                   tags: Optional[list[str]] = None) -> Optional[str]:
-    token_b64 = os.getenv("YOUTUBE_TOKEN_B64")
-    if not token_b64:
-        log.warning("YOUTUBE_TOKEN_B64 not set")
+
+# ══════════════════════════════════════════════════════════════════════
+# STEP 11b — TIKTOK UPLOAD, DIRECT (Content Posting API v2) — fallback when no
+# ZERNIO_API_KEY is set; unaudited apps can only post privately this way
+#
+#  Flow: refresh access token → query creator_info (allowed privacy
+#  levels) → POST /video/init/ (FILE_UPLOAD) → PUT raw video bytes to
+#  the returned upload_url → poll /status/fetch/ until PUBLISH_COMPLETE.
+#
+#  IMPORTANT CAVEAT (real TikTok platform constraint, not a bug here):
+#  until this TikTok developer app has passed TikTok's content-posting
+#  audit, every video posted via the API is forced to SELF_ONLY privacy
+#  (visible only to the account owner) regardless of what's requested.
+#  Once the app is audited/approved, PUBLIC_TO_EVERYONE becomes an
+#  available option and this code will pick it up automatically (it
+#  reads the allowed levels fresh from creator_info on every run).
+# ══════════════════════════════════════════════════════════════════════
+
+TIKTOK_API = "https://open.tiktokapis.com/v2"
+
+def _tiktok_refresh_token() -> Optional[str]:
+    """Exchange the long-lived TIKTOK_REFRESH_TOKEN for a fresh access token."""
+    client_key    = os.getenv("TIKTOK_CLIENT_KEY")
+    client_secret = os.getenv("TIKTOK_CLIENT_SECRET")
+    refresh_token = os.getenv("TIKTOK_REFRESH_TOKEN")
+    if not (client_key and client_secret and refresh_token):
+        log.warning("TikTok: missing TIKTOK_CLIENT_KEY/SECRET/REFRESH_TOKEN — skipping upload")
         return None
-    creds_data = pickle.loads(base64.b64decode(token_b64))
-    if isinstance(creds_data, Credentials):
-        creds = creds_data
-    elif isinstance(creds_data, str):
-        creds = Credentials.from_authorized_user_info(json.loads(creds_data))
-    else:
-        creds = Credentials.from_authorized_user_info(creds_data)
-
-    yt        = build("youtube","v3",credentials=creds,cache_discovery=False)
-    pub_at    = (datetime.utcnow()+timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    tag_list  = [t.lstrip("#") for t in (tags or ["shorts", "viral"])][:15]
-    body      = {"snippet":  {"title": title[:100], "description": description,
-                             "tags": tag_list, "categoryId": "22"},
-               "status":   {"privacyStatus": "private", "publishAt": pub_at,
-                             "selfDeclaredMadeForKids": False}}
-    media   = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
-    req     = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-    resp    = None
-    while resp is None:
-        _, resp = req.next_chunk()
-    vid_url = f"https://youtu.be/{resp['id']}"
-    log.info("YouTube upload: %s", vid_url)
-
-    if srt_path and Path(srt_path).exists():
-        try:
-            yt.captions().insert(
-                part="snippet",
-                body={"snippet":{"videoId":resp["id"],"language":"en",
-                                  "name":"Auto","isDraft":False}},
-                media_body=MediaFileUpload(srt_path, mimetype="text/plain"),
-            ).execute()
-        except Exception as e:
-            log.warning("Caption upload skipped: %s", e)
-    return vid_url
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 11b — TIKTOK UPLOAD via Zernio (unified posting API, free tier)
-#
-#  Zernio already holds its own audited TikTok app, so posting is three
-#  plain REST calls from here — no TikTok developer app, no OAuth dance,
-#  no refresh tokens on our side. Free tier: 2 connected accounts,
-#  unlimited posts, full API access — comfortably covers one daily post.
-#  (TikTok's own Content Posting API explicitly does not approve
-#  single-account personal-use tools — this sidesteps that restriction
-#  the same way any scheduler like Buffer/Later does.)
-#
-#  Setup (one-time, in Zernio's dashboard, not in this code):
-#    1. Sign up at zernio.com (free, no credit card)
-#    2. Connect your TikTok account (one-click OAuth button)
-#    3. Copy the API key into the ZERNIO_API_KEY secret
-# ══════════════════════════════════════════════════════════════════════
-
-ZERNIO_API = "https://zernio.com/api/v1"
-
-def _zernio_tiktok_account_id(api_key: str) -> Optional[str]:
-    """Auto-resolve the connected TikTok account so no manual ID copy-paste
-    is needed — falls back to ZERNIO_TIKTOK_ACCOUNT_ID if set explicitly."""
-    override = os.getenv("ZERNIO_TIKTOK_ACCOUNT_ID")
-    if override:
-        return override
     try:
-        r = requests.get(f"{ZERNIO_API}/accounts",
-                         headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
-        accounts = r.json()
-        accounts = accounts.get("accounts", accounts) if isinstance(accounts, dict) else accounts
-        for acc in accounts:
-            if acc.get("platform") == "tiktok":
-                return acc.get("id") or acc.get("_id")
+        r = requests.post(
+            "https://open.tiktokapis.com/v2/oauth/token/",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"client_key": client_key, "client_secret": client_secret,
+                  "grant_type": "refresh_token", "refresh_token": refresh_token},
+            timeout=20,
+        )
+        data = r.json()
+        if "access_token" in data:
+            log.info("TikTok: access token refreshed (expires in %ss)", data.get("expires_in"))
+            return data["access_token"]
+        log.warning("TikTok: token refresh failed: %s", data)
     except Exception as e:
-        log.warning("Zernio: could not list accounts: %s", e)
+        log.warning("TikTok: token refresh error: %s", e)
     return None
 
 
-def upload_tiktok(video_path: str, title: str, hashtags: Optional[list[str]] = None) -> Optional[str]:
+def _tiktok_creator_info(token: str) -> dict:
+    try:
+        r = requests.post(f"{TIKTOK_API}/post/publish/creator_info/query/",
+                          headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        body = r.json()
+        log.info("TikTok creator_info raw response [%s]: %s", r.status_code, body)
+        return body.get("data", {})
+    except Exception as e:
+        log.warning("TikTok: creator_info query failed: %s", e)
+        return {}
+
+
+def _upload_tiktok_direct(video_path: str, title: str, hashtags: Optional[list[str]] = None) -> Optional[str]:
     """
-    Post a video to TikTok via Zernio (presign -> upload bytes -> create
-    post). Returns the Zernio post id on success, or None (upload
-    skipped/failed) — callers already treat a falsy return as "not posted".
+    Direct-Post a video to TikTok via the Content Posting API (FILE_UPLOAD).
+    Returns a status string (publish_id) since TikTok's API does not hand
+    back a public post URL synchronously — check the account for the live
+    post once PUBLISH_COMPLETE is reached.
     """
-    api_key = os.getenv("ZERNIO_API_KEY")
-    if not api_key:
-        log.warning("Zernio: missing ZERNIO_API_KEY — skipping upload")
+    token = _tiktok_refresh_token()
+    if not token:
         return None
 
-    account_id = _zernio_tiktok_account_id(api_key)
-    if not account_id:
-        log.warning("Zernio: no connected TikTok account found — skipping upload")
-        return None
+    info          = _tiktok_creator_info(token)
+    allowed_priv  = info.get("privacy_level_options") or ["SELF_ONLY"]
+    # Prefer public if the app's audit status allows it; otherwise SELF_ONLY
+    # is the only privacy_level unaudited clients are actually permitted to
+    # post with — don't just grab allowed_priv[0], since a private account's
+    # options can list FOLLOWER_OF_CREATOR/MUTUAL_FOLLOW_FRIENDS first, and
+    # TikTok rejects those for unaudited apps even though they're "valid"
+    # options for the account in general.
+    if "PUBLIC_TO_EVERYONE" in allowed_priv:
+        privacy = "PUBLIC_TO_EVERYONE"
+    elif "SELF_ONLY" in allowed_priv:
+        privacy = "SELF_ONLY"
+    else:
+        privacy = allowed_priv[0]
+    if privacy == "SELF_ONLY":
+        log.warning("TikTok: app not yet audited for public posting — "
+                    "video will upload as private (visible only to the account owner)")
+    log.info("TikTok: creator=%s privacy_level_options=%s -> using privacy=%s",
+              info.get("creator_username"), allowed_priv, privacy)
 
     caption = title[:150]
     if hashtags:
         tag_line = " ".join(h if h.startswith("#") else f"#{h}" for h in hashtags)
         caption  = f"{caption} {tag_line}"[:2200]
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    # TikTok requires an explicit privacy level that the creator allows;
-    # read the allowed ones and prefer public, fall back to public on error.
-    privacy = "PUBLIC_TO_EVERYONE"
+    size = Path(video_path).stat().st_size
     try:
-        info = requests.get(
-            f"{ZERNIO_API}/accounts/{account_id}/tiktok/creator-info",
-            headers=headers, params={"mediaType": "video"}, timeout=20,
-        ).json()
-        levels = [p.get("value") for p in info.get("privacyLevels", []) if p.get("value")]
-        if levels and privacy not in levels:
-            privacy = levels[0]
-            log.warning("Zernio: public posting not allowed for this account — using %s", privacy)
-    except Exception as e:
-        log.warning("Zernio: creator-info lookup failed (%s) — assuming public", e)
-
-    try:
-        presign = requests.post(
-            f"{ZERNIO_API}/media/presign", headers=headers,
-            json={"filename": Path(video_path).name, "contentType": "video/mp4"},
+        init = requests.post(
+            f"{TIKTOK_API}/post/publish/video/init/",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "post_info": {
+                    "title": caption,
+                    "privacy_level": privacy,
+                    "disable_duet": False,
+                    "disable_comment": False,
+                    "disable_stitch": False,
+                    "video_cover_timestamp_ms": 1000,
+                },
+                "source_info": {
+                    "source": "FILE_UPLOAD",
+                    "video_size": size,
+                    "chunk_size": size,
+                    "total_chunk_count": 1,
+                },
+            },
             timeout=30,
         ).json()
-        upload_url, public_url = presign.get("uploadUrl"), presign.get("publicUrl")
-        if not upload_url:
-            log.warning("Zernio: presign failed: %s", presign)
-            return None
-
-        with open(video_path, "rb") as f:
-            put = requests.put(upload_url, data=f,
-                               headers={"Content-Type": "video/mp4"}, timeout=300)
-        if put.status_code not in (200, 201):
-            log.warning("Zernio: video PUT failed (%d)", put.status_code)
-            return None
-
-        # publishNow=True is essential: without it (or scheduledFor) Zernio
-        # silently saves the post as a DRAFT and nothing reaches TikTok.
-        resp = requests.post(
-            f"{ZERNIO_API}/posts", headers=headers,
-            json={
-                "content": caption,
-                "mediaItems": [{"type": "video", "url": public_url}],
-                "platforms": [{"platform": "tiktok", "accountId": account_id}],
-                "tiktokSettings": {
-                    "privacy_level": privacy,
-                    "allow_comment": True,
-                    "allow_duet": True,
-                    "allow_stitch": True,
-                    "content_preview_confirmed": True,
-                    "express_consent_given": True,
-                },
-                "publishNow": True,
-            },
-            timeout=120,
-        )
-        post = resp.json()
     except Exception as e:
-        log.warning("Zernio: upload failed: %s", e)
+        log.warning("TikTok: init request failed: %s", e)
         return None
 
-    # 201 = published; 207 = created but TikTok rejected it (see errorMessage)
-    post_obj = post.get("post") or {}
-    for plat in post_obj.get("platforms", []):
-        if plat.get("status") == "failed":
-            log.warning("Zernio: TikTok rejected the post: %s", plat.get("errorMessage"))
-    if resp.status_code not in (200, 201) or post_obj.get("status") in ("failed", "draft"):
-        log.warning("Zernio: post not published (HTTP %d, status=%s): %s",
-                    resp.status_code, post_obj.get("status"), post)
+    data = init.get("data", {})
+    upload_url, publish_id = data.get("upload_url"), data.get("publish_id")
+    if not upload_url:
+        log.warning("TikTok: init response missing upload_url: %s", init)
         return None
 
-    post_id = post_obj.get("_id") or post.get("_id") or post.get("id")
-    if not post_id:
-        log.warning("Zernio: unexpected post response: %s", post)
+    try:
+        with open(video_path, "rb") as f:
+            put = requests.put(
+                upload_url,
+                headers={"Content-Type": "video/mp4",
+                         "Content-Range": f"bytes 0-{size-1}/{size}"},
+                data=f, timeout=180,
+            )
+        if put.status_code not in (200, 201):
+            log.warning("TikTok: video PUT failed (%d): %s", put.status_code, put.text[:200])
+            return None
+    except Exception as e:
+        log.warning("TikTok: video upload error: %s", e)
         return None
-    log.info("Zernio: TikTok post %s — status=%s", post_id, post_obj.get("status"))
-    return post_id
+
+    # Poll publish status (async on TikTok's side)
+    for _ in range(20):
+        time.sleep(3)
+        try:
+            status = requests.post(
+                f"{TIKTOK_API}/post/publish/status/fetch/",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"publish_id": publish_id}, timeout=15,
+            ).json().get("data", {})
+        except Exception as e:
+            log.warning("TikTok: status poll error: %s", e)
+            break
+        st = status.get("status")
+        if st == "PUBLISH_COMPLETE":
+            log.info("TikTok upload complete: %s (privacy=%s)", publish_id, privacy)
+            return publish_id
+        if st == "FAILED":
+            log.warning("TikTok: publish failed: %s", status)
+            return None
+    log.info("TikTok: upload accepted, still processing (publish_id=%s)", publish_id)
+    return publish_id
 
 
 # ══════════════════════════════════════════════════════════════════════
 # STEP 12 — DASHBOARD
 # ══════════════════════════════════════════════════════════════════════
 
-def update_dashboard(niche, title, url, ok, platform="youtube"):
-    p    = Path("dashboard.json")
-    data = json.loads(p.read_text()) if p.exists() else {"videos":[]}
-    data["videos"].insert(0,{"niche":niche,"title":title,"url":url,
-                              "ok":ok,"platform":platform,
-                              "ts":datetime.utcnow().isoformat()})
-    data["videos"] = data["videos"][:50]
-    p.write_text(json.dumps(data,indent=2))
-
-
 # ══════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════
-
-
-# ══════════════════════════════════════════════════════════════════════
-# POST-RENDER STEP A — ANIMATED CAPTIONS (beautiful-captions)
+# STEP 11c — TIKTOK UPLOAD VIA ZERNIO (preferred: public posts, no own app audit)
 #
-#  Takes the raw rendered video + word-level SRT and burns in
-#  Montserrat bounce-animated captions — exactly the viral TikTok look.
-#  Falls back gracefully to static ffmpeg subtitles if unavailable.
+#  Zernio (zernio.com) is a posting API that already holds an audited TikTok
+#  app, so videos can go out PUBLICLY without waiting for our own TikTok
+#  Developer review. One-time setup:
+#    1. Sign up at zernio.com (free tier) and connect the TikTok account
+#    2. Create an API key -> GitHub secret ZERNIO_API_KEY
+#    3. Set the TikTok account back to PUBLIC (a private account can't post
+#       publicly)
+#  Without ZERNIO_API_KEY the direct TikTok API above is used instead.
 # ══════════════════════════════════════════════════════════════════════
 
-def apply_beautiful_captions(
-    video_path:  str,
-    srt_path:    str,
-    output_path: str,
-    accent:      str = "#FFD700",
-    words_per_line: int = 2,
-) -> str:
-    """
-    Burn animated word-by-word captions onto video.
-    Returns output_path (or video_path unchanged if both methods fail).
-    """
-    if not Path(srt_path).exists():
-        log.warning("SRT missing — skipping caption burn")
-        return video_path
+ZERNIO_API = "https://zernio.com/api/v1"
+ZERNIO_AI_LABEL = True  # synthetic voice + AI-written commentary -> disclose it on TikTok
 
-    # ── Method 1: beautiful-captions (bounce animation) ───────────────
-    if BEAUTIFUL_CAPTIONS_OK:
-        try:
-            cfg = CaptionConfig(
-                animation={"enabled": True, "type": "bounce", "keyframes": 12},
-                style={
-                    "font":              "Montserrat",
-                    "font_size":         140,
-                    "color":             "yellow",
-                    "outline_color":     "black",
-                    "outline_thickness": 12,
-                    "verticle_position": 0.50,   # center-screen (note: their typo)
-                    "max_words_per_line": words_per_line,
-                    "auto_scale_font":   True,
-                },
-                diarization={"enabled": False},
-            )
-            vid = BCVideo(video_path, config=cfg)
-            vid.add_captions(
-                srt_input_path=srt_path,
-                output_path=output_path,
-                add_styling=True,
-                cuda=False,
-            )
-            log.info("beautiful-captions: bounce captions applied → %s", output_path)
-            return output_path
-        except Exception as e:
-            log.warning("beautiful-captions failed (%s) — falling back to ASS", e)
 
-    # ── Method 2: ffmpeg ASS karaoke subtitles (fallback) ─────────────
+def _zernio_headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def _zernio_tiktok_account_id(api_key: str) -> Optional[str]:
+    override = (os.getenv("ZERNIO_TIKTOK_ACCOUNT_ID") or "").strip()
+    if override:
+        return override
     try:
-        ass_path = srt_path.replace(".srt", ".ass")
-        _srt_to_ass_karaoke(srt_path, ass_path, accent)
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", f"ass={ass_path}",
-            "-c:a", "copy", "-preset", "fast", output_path,
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        log.info("ASS karaoke captions applied → %s", output_path)
-        return output_path
+        r = requests.get(f"{ZERNIO_API}/accounts", headers=_zernio_headers(api_key), timeout=20)
+        if not r.ok:
+            log.warning("Zernio: listing accounts failed [%s]: %s", r.status_code, r.text[:300])
+            return None
+        data = r.json()
+        accounts = data.get("accounts", []) if isinstance(data, dict) else data
+        tiktok = [a for a in accounts
+                  if str(a.get("platform", "")).lower() == "tiktok" and a.get("isActive", True) is not False]
+        if not tiktok:
+            log.warning("Zernio: no TikTok account connected — connect it in the Zernio dashboard")
+            return None
+        return tiktok[0].get("_id") or tiktok[0].get("id")
     except Exception as e:
-        log.warning("ASS fallback also failed (%s) — returning raw video", e)
-        return video_path
+        log.warning("Zernio: account lookup error: %s", e)
+        return None
 
 
-def _srt_to_ass_karaoke(srt_path: str, ass_path: str, accent: str) -> None:
-    """
-    Convert SRT to ASS with karaoke-style word highlighting.
-    Each word highlights in accent color as it is spoken.
-    """
-    def ms_to_ass(ms: int) -> str:
-        h  = ms // 3600000
-        m  = (ms % 3600000) // 60000
-        s  = (ms % 60000) // 1000
-        cs = (ms % 1000) // 10
-        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+def _zernio_creator_levels(api_key: str, account_id: str) -> list:
+    """Privacy levels TikTok currently allows for this creator (empty if unknown)."""
+    try:
+        r = requests.get(f"{ZERNIO_API}/accounts/{account_id}/tiktok/creator-info",
+                         params={"mediaType": "video"}, headers=_zernio_headers(api_key), timeout=20)
+        log.info("Zernio creator-info [%s]: %s", r.status_code, r.text[:500])
+        if not r.ok:
+            return []
+        out = []
+        for lvl in (r.json().get("privacyLevels") or []):
+            if isinstance(lvl, str):
+                out.append(lvl)
+            elif isinstance(lvl, dict):
+                v = lvl.get("value") or lvl.get("privacy_level") or lvl.get("level") or lvl.get("id")
+                if v:
+                    out.append(str(v))
+        return out
+    except Exception as e:
+        log.warning("Zernio: creator-info error: %s", e)
+        return []
 
-    # Convert accent hex to ASS BGR
-    r, g, b  = _hex(accent)
-    ass_col  = f"&H00{b:02X}{g:02X}{r:02X}&"
 
-    header = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {VIDEO_W}
-PlayResY: {VIDEO_H}
-ScaledBorderAndShadow: yes
+def _zernio_pick_privacy(levels: list) -> str:
+    for pref in ("PUBLIC_TO_EVERYONE", "FOLLOWER_OF_CREATOR", "MUTUAL_FOLLOW_FRIENDS", "SELF_ONLY"):
+        if pref in levels:
+            return pref
+    return "PUBLIC_TO_EVERYONE"  # creator-info unavailable -> try public
 
-[V4+ Styles]
-Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,ScaleX,ScaleY,Spacing,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV
-Style: Default,Arial,85,&H00FFFFFF,{ass_col},&H00000000,&H99000000,-1,0,0,100,100,0,1,6,2,2,60,60,220
 
-[Events]
-Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-"""
-    lines = Path(srt_path).read_text().strip().split('\n\n')
-    events = []
-    for block in lines:
-        parts = block.strip().split('\n')
-        if len(parts) < 3:
-            continue
-        # Parse timing line: 00:00:00,000 --> 00:00:02,500
-        try:
-            timing = parts[1]
-            start_str, end_str = timing.split(" --> ")
-            def parse_t(t):
-                t = t.replace(",", ".")
-                h, m, s = t.split(":")
-                return int((int(h)*3600 + int(m)*60 + float(s)) * 1000)
-            start_ms  = parse_t(start_str.strip())
-            end_ms    = parse_t(end_str.strip())
-            text      = " ".join(parts[2:])
-            words     = text.split()
-            dur_ms    = end_ms - start_ms
-            word_dur  = dur_ms // max(len(words), 1)
-            # Build karaoke tags: {\k<centiseconds>}word
-            _k        = chr(92) + "k"
-            karaoke   = " ".join("{" + _k + str(word_dur // 10) + "}" + w for w in words)
-            events.append(
-                f"Dialogue: 0,{ms_to_ass(start_ms)},{ms_to_ass(end_ms)},"
-                f"Default,,0,0,0,,{karaoke}"
-            )
-        except Exception:
-            continue
-    Path(ass_path).write_text(header + '\n'.join(events), encoding='utf-8')
+def _zernio_create_post(headers: dict, payload: dict) -> tuple:
+    """POST /posts. Returns (post_id or None, error_text). Success means HTTP 2xx
+    AND the TikTok platform entry didn't come back as failed."""
+    try:
+        r = requests.post(f"{ZERNIO_API}/posts", headers=headers, json=payload, timeout=120)
+    except Exception as e:
+        return None, f"request error: {e}"
+    if not r.ok:
+        return None, f"HTTP {r.status_code}: {r.text[:600]}"
+    try:
+        post = (r.json().get("post") or {})
+    except Exception:
+        return None, f"unreadable response: {r.text[:300]}"
+    plats = post.get("platforms") or []
+    status = str((plats[0] if plats else {}).get("status") or post.get("status") or "").lower()
+    if status in ("failed", "error"):
+        return None, f"platform status {status}: {r.text[:600]}"
+    pid = post.get("_id") or post.get("id")
+    log.info("Zernio: TikTok post %s accepted (status=%s)", pid, status or "?")
+    return pid, ""
+
+
+def _upload_tiktok_zernio(video_path: str, title: str, hashtags: Optional[list[str]] = None) -> Optional[str]:
+    api_key = (os.getenv("ZERNIO_API_KEY") or "").strip()
+    account_id = _zernio_tiktok_account_id(api_key)
+    if not account_id:
+        return None
+    headers = _zernio_headers(api_key)
+
+    levels = _zernio_creator_levels(api_key, account_id)
+    privacy = _zernio_pick_privacy(levels)
+    if levels and "PUBLIC_TO_EVERYONE" not in levels:
+        log.warning("Zernio: TikTok only offers %s — the account is probably set to PRIVATE. "
+                    "Switch it to public in TikTok (Settings -> Privacy) for public posts.", levels)
+
+    # 1) presigned upload -> 2) PUT the file -> 3) create the post
+    try:
+        pre = requests.post(f"{ZERNIO_API}/media/presign", headers=headers, timeout=30,
+                            json={"filename": f"ballfight_{int(time.time())}.mp4",
+                                  "contentType": "video/mp4", "size": os.path.getsize(video_path)})
+        if not pre.ok:
+            log.warning("Zernio: presign failed [%s]: %s", pre.status_code, pre.text[:300])
+            return None
+        upload_url, public_url = pre.json().get("uploadUrl"), pre.json().get("publicUrl")
+        if not (upload_url and public_url):
+            log.warning("Zernio: presign response missing urls: %s", pre.text[:300])
+            return None
+        with open(video_path, "rb") as f:
+            put = requests.put(upload_url, data=f, headers={"Content-Type": "video/mp4"}, timeout=300)
+        if not put.ok:
+            log.warning("Zernio: video upload failed [%s]: %s", put.status_code, put.text[:300])
+            return None
+    except Exception as e:
+        log.warning("Zernio: media upload error: %s", e)
+        return None
+
+    tags = " ".join(f"#{h.lstrip('#')}" for h in (hashtags or [])[:8])
+    caption = f"{title[:150]} {tags}".strip()[:2200]
+    settings = {"privacy_level": privacy, "allow_comment": True, "allow_duet": True,
+                "allow_stitch": True, "content_preview_confirmed": True,
+                "express_consent_given": True, "video_made_with_ai": ZERNIO_AI_LABEL}
+
+    for attempt in range(1, 4):
+        payload = {"content": caption,
+                   "mediaItems": [{"type": "video", "url": public_url}],
+                   "platforms": [{"platform": "tiktok", "accountId": account_id}],
+                   "tiktokSettings": settings, "publishNow": True}
+        pid, err = _zernio_create_post(headers, payload)
+        if pid:
+            return pid
+        log.warning("Zernio: post attempt %d failed: %s", attempt, err)
+        low = err.lower()
+        if any(k in low for k in ("duet", "stitch", "comment")) and settings["allow_duet"]:
+            settings.update(allow_comment=False, allow_duet=False, allow_stitch=False)
+        elif "privacy" in low and levels:
+            tried = settings["privacy_level"]
+            nxt = next((l for l in levels if l != tried), None)
+            if not nxt:
+                break
+            settings["privacy_level"] = nxt
+        elif any(k in low for k in ("capacity", "active user", "limit", "cap")) and not settings.get("draft"):
+            log.warning("Zernio: TikTok capacity reached — sending to the creator inbox as a draft instead")
+            settings["draft"] = True
+        else:
+            break
+    return None
+
+
+def upload_tiktok(video_path: str, title: str, hashtags: Optional[list[str]] = None) -> Optional[str]:
+    """Publish to TikTok: via Zernio when ZERNIO_API_KEY is set (public posts),
+    otherwise through the direct Content Posting API (private until audited)."""
+    if (os.getenv("ZERNIO_API_KEY") or "").strip():
+        return _upload_tiktok_zernio(video_path, title, hashtags)
+    log.info("ZERNIO_API_KEY not set — using the direct TikTok Content Posting API")
+    return _upload_tiktok_direct(video_path, title, hashtags)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2124,347 +632,9 @@ def apply_color_grade(video_path: str, output_path: str,
 #  Only runs if google-auth Drive scope is available.
 # ══════════════════════════════════════════════════════════════════════
 
-def backup_to_drive(video_path: str, srt_path: str, title: str) -> Optional[str]:
-    """
-    Upload finished video to Google Drive → 'VaultMind' folder.
-    Returns Drive file URL or None.
-    """
-    try:
-        from googleapiclient.discovery import build as gdrive_build
-        token_b64 = os.getenv("YOUTUBE_TOKEN_B64")
-        if not token_b64:
-            return None
-        creds_data = pickle.loads(base64.b64decode(token_b64))
-        if isinstance(creds_data, Credentials):
-            creds = creds_data
-        elif isinstance(creds_data, str):
-            creds = Credentials.from_authorized_user_info(json.loads(creds_data))
-        else:
-            creds = Credentials.from_authorized_user_info(creds_data)
-
-        drive    = gdrive_build("drive", "v3", credentials=creds)
-
-        # Find or create VaultMind folder
-        q        = "name='VaultMind' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-        results  = drive.files().list(q=q, fields="files(id)").execute()
-        folders  = results.get("files", [])
-        if folders:
-            folder_id = folders[0]["id"]
-        else:
-            folder_meta = {"name": "VaultMind",
-                           "mimeType": "application/vnd.google-apps.folder"}
-            folder_id = drive.files().create(body=folder_meta,
-                                              fields="id").execute()["id"]
-
-        # Upload video
-        vid_meta  = {"name": f"{title}.mp4", "parents": [folder_id]}
-        vid_media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
-        vid_file  = drive.files().create(
-            body=vid_meta, media_body=vid_media, fields="id,webViewLink"
-        ).execute()
-        link = vid_file.get("webViewLink", "")
-        log.info("Drive backup: %s", link)
-        return link
-    except Exception as e:
-        log.warning("Drive backup skipped: %s", e)
-        return None
-
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SELF-LEARNING: VIRAL VIDEO ANALYZER
-#
-#  Runs BEFORE script generation on each pipeline run.
-#  Uses only FREE tools:
-#    • yt-dlp   → download captions (no Whisper needed for YouTube)
-#    • ffmpeg   → extract keyframes
-#    • Groq Vision (llama-4-scout) → analyze frames (free tier, 1000 RPD)
-#
-#  Result: viral_patterns.json committed to repo.
-#  Script generator reads it and adapts prompts automatically.
-#
-#  Curated viral Shorts per niche — all public YouTube URLs.
-#  Update this list by adding YouTube Shorts links you like.
-# ══════════════════════════════════════════════════════════════════════
-
-VIRAL_REFERENCE_VIDEOS = {
-    "fact":       ["https://www.youtube.com/shorts/2gpg7W7ht6A"],
-    "scary":      ["https://youtube.com/shorts/JCEEvR-1b2A"],
-    "motivation": ["https://youtube.com/shorts/5f7E4DQG6kk"],
-    "reddit":     ["https://youtube.com/shorts/P0xBYEwcl-4"],
-    "rich":       ["https://youtube.com/shorts/g1jmkEjykLk"],
-    "conspiracy": ["https://youtube.com/shorts/VUyBmwGpzkE"],
-    "dating":     ["https://youtube.com/shorts/2W4SDn_6WEw"],
-    "lifehack":   ["https://youtube.com/shorts/klMk4UkYQ0o"],
-    "learn":      [
-        "https://youtube.com/shorts/kxOFEpLKNpk",
-        "https://youtube.com/shorts/qHf2RSKLbsw",
-    ],
-}
-
-
-def _extract_youtube_captions(url: str, out_path: str) -> Optional[str]:
-    """Download auto-captions from YouTube via yt-dlp (free, no Whisper)."""
-    try:
-        import yt_dlp
-        opts = {
-            "skip_download":    True,
-            "writeautomaticsub": True,
-            "writesubtitles":   True,
-            "subtitleslangs":   ["en"],
-            "subtitlesformat":  "vtt",
-            "outtmpl":          out_path.replace(".vtt",""),
-            "quiet":            True,
-            "nocheckcertificate": True,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        # yt-dlp appends .en.vtt
-        vtt = out_path.replace(".vtt","") + ".en.vtt"
-        if Path(vtt).exists():
-            # Strip VTT timing tags → plain text
-            text = Path(vtt).read_text(errors="ignore")
-            lines = []
-            for line in text.splitlines():
-                line = line.strip()
-                if line and "-->" not in line and not line.startswith("WEBVTT")                         and not line.startswith("NOTE") and not line.isdigit():
-                    import re
-                    clean = re.sub(r"<[^>]+>", "", line)
-                    if clean and clean not in lines[-3:]:
-                        lines.append(clean)
-            return " ".join(lines)[:3000]
-    except Exception as e:
-        log.debug("Caption extraction failed: %s", e)
-    return None
-
-
-def _extract_frames(url: str, out_dir: str, n_frames: int = 8) -> list[str]:
-    """
-    Download video and extract n_frames keyframes as JPEGs.
-    Uses yt-dlp + ffmpeg — both already in the GitHub Actions environment.
-    """
-    try:
-        import yt_dlp
-        video_path = os.path.join(out_dir, "clip.mp4")
-        opts = {
-            "format":    "bestvideo[height<=720][ext=mp4]/best[height<=720]",
-            "outtmpl":   video_path,
-            "quiet":     True,
-            "nocheckcertificate": True,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-
-        if not Path(video_path).exists():
-            return []
-
-        # Get duration
-        probe = subprocess.run(
-            ["ffprobe","-v","quiet","-show_entries","format=duration",
-             "-of","default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True
-        )
-        duration = float(probe.stdout.strip() or "60")
-
-        # Extract evenly-spaced frames
-        frame_paths = []
-        for i in range(n_frames):
-            t        = duration * (i + 0.5) / n_frames
-            out_jpg  = os.path.join(out_dir, f"frame_{i:02d}.jpg")
-            subprocess.run(
-                ["ffmpeg","-y","-ss",str(t),"-i",video_path,
-                 "-frames:v","1","-q:v","3","-vf","scale=512:-1",
-                 out_jpg],
-                capture_output=True
-            )
-            if Path(out_jpg).exists():
-                frame_paths.append(out_jpg)
-        return frame_paths
-    except Exception as e:
-        log.debug("Frame extraction failed: %s", e)
-        return []
-
-
-def _analyze_frames_groq(frames: list[str], transcript: str,
-                          niche: str) -> Optional[dict]:
-    """
-    Send frames + transcript to Groq Vision (llama-4-scout, free).
-    Returns structured analysis dict or None on failure.
-    """
-    key = os.getenv("GROQ_API_KEY")
-    if not key:
-        return None
-    try:
-        import base64
-        client = Groq(api_key=key)
-
-        # Build image content blocks (max 6 to save tokens)
-        image_blocks = []
-        for fp in frames[:6]:
-            with open(fp, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            image_blocks.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-            })
-
-        prompt = (
-            f'You are a viral short-form video analyst. Niche: {niche}.\n'
-            f'Transcript snippet: "{transcript[:600]}"\n\n'
-            'Analyze these video frames and return a JSON object with:\n'
-            '- hook_style: how does the first 2 seconds grab attention?\n'
-            '- caption_style: font size (small/medium/large), position (top/center/bottom), '
-            'highlighted words yes/no, color\n'
-            '- cut_speed: average scene length estimate in seconds (e.g. 2, 3, 4)\n'
-            '- visual_style: dark/bright/colorful/minimal, any overlays or effects\n'
-            '- text_animation: bounce/fade/none/pop\n'
-            '- background_type: stock_footage/solid_color/gameplay/animation\n'
-            '- emotional_trigger: curiosity/fear/inspiration/humor/shock\n'
-            '- what_makes_it_viral: 1-2 sentences\n'
-            'Return ONLY valid JSON, no explanation.'
-        )
-
-        resp = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[{
-                "role": "user",
-                "content": image_blocks + [{"type": "text", "text": prompt}]
-            }],
-            response_format={"type": "json_object"},
-            max_tokens=500,
-            temperature=0.3,
-        )
-        return json.loads(resp.choices[0].message.content)
-    except Exception as e:
-        log.warning("Groq Vision analysis failed: %s", e)
-        return None
-
-
-def analyze_viral_videos(force: bool = False) -> dict:
-    """
-    Analyze curated viral reference videos and update viral_patterns.json.
-
-    Skips if viral_patterns.json was updated in the last 3 days (to avoid
-    hitting Groq rate limits on every run). Set force=True to override.
-
-    Returns the loaded patterns dict.
-    """
-    patterns_path = Path("viral_patterns.json")
-
-    # Load existing patterns
-    if patterns_path.exists():
-        try:
-            existing = json.loads(patterns_path.read_text())
-        except Exception:
-            existing = {}
-    else:
-        existing = {}
-
-    # Skip if recently updated
-    last_run = existing.get("_last_analyzed", "")
-    if not force and last_run:
-        try:
-            age_days = (datetime.utcnow() -
-                        datetime.fromisoformat(last_run)).days
-            if age_days < 3:
-                log.info("viral_patterns.json is %d days old — skipping analysis", age_days)
-                return existing
-        except Exception:
-            pass
-
-    log.info("Starting viral video analysis…")
-    patterns = dict(existing)
-
-    for niche, urls in VIRAL_REFERENCE_VIDEOS.items():
-        if not urls:
-            continue
-        niche_results = []
-        for url in urls[:2]:   # max 2 per niche per run (rate limit friendly)
-            log.info("Analyzing [%s]: %s", niche, url)
-            with tempfile.TemporaryDirectory() as td:
-                transcript = _extract_youtube_captions(url, os.path.join(td,"caps.vtt"))
-                transcript = transcript or ""
-                frames     = _extract_frames(url, td, n_frames=8)
-                if not frames:
-                    log.warning("No frames extracted for %s", url)
-                    continue
-                analysis = _analyze_frames_groq(frames, transcript, niche)
-                if analysis:
-                    analysis["url"]       = url
-                    analysis["analyzed_at"] = datetime.utcnow().isoformat()
-                    niche_results.append(analysis)
-                    log.info("[%s] Analysis: %s", niche,
-                             json.dumps(analysis, indent=2)[:300])
-                time.sleep(2)   # be gentle on rate limits
-
-        if niche_results:
-            patterns[niche] = niche_results
-
-    patterns["_last_analyzed"] = datetime.utcnow().isoformat()
-    patterns_path.write_text(json.dumps(patterns, indent=2))
-    log.info("viral_patterns.json updated (%d niches)", len(patterns)-1)
-    return patterns
-
-
-def load_viral_patterns() -> dict:
-    """Load existing viral patterns, return empty dict if unavailable."""
-    try:
-        p = Path("viral_patterns.json")
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-
-def patterns_to_prompt_hints(patterns: dict, niche: str) -> str:
-    """
-    Convert analyzed viral patterns for a niche into concrete script hints.
-    These get injected into the Groq script generation prompt.
-    """
-    niche_data = patterns.get(niche, [])
-    if not niche_data:
-        return ""
-
-    # Aggregate across multiple analyzed videos
-    cut_speeds  = [d.get("cut_speed", 3) for d in niche_data if "cut_speed" in d]
-    hook_styles = [d.get("hook_style","") for d in niche_data if d.get("hook_style")]
-    triggers    = [d.get("emotional_trigger","") for d in niche_data if d.get("emotional_trigger")]
-    viral_tips  = [d.get("what_makes_it_viral","") for d in niche_data if d.get("what_makes_it_viral")]
-
-    avg_cut = round(sum(cut_speeds)/len(cut_speeds), 1) if cut_speeds else 3.5
-    hints = [
-        f"VIRAL DATA for {niche} (learned from real viral videos in this niche):",
-        f"- Ideal scene length: ~{avg_cut}s per scene",
-    ]
-    if hook_styles:
-        hints.append(f"- Hook style that works: {hook_styles[0]}")
-    if triggers:
-        unique_triggers = list(dict.fromkeys(triggers))
-        hints.append(f"- Emotional triggers that drive retention: {', '.join(unique_triggers[:3])}")
-    if viral_tips:
-        hints.append(f"- What makes {niche} videos go viral: {viral_tips[0]}")
-    return '\n'.join(hints)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# BALL FIGHT ENGINE — physics-simulated arena videos for TikTok
-#
-#  Three self-contained game modes, chosen at random each run:
-#    • battle_royale   — shrinking circular arena, last ball standing
-#    • color_infection — team-color "paint tag", one color takes the arena
-#    • gravity_race    — pachinko-style drop race to the finish line
-#
-#  Every run randomizes: ball count, colors, skins/patterns, arena size,
-#  and which of the 4 synthesized music moods plays — so no two videos
-#  look or sound alike, per spec ("neue Bälle", "dynamische Musik").
-# ══════════════════════════════════════════════════════════════════════
-
-import colorsys
-
 BF_W, BF_H, BF_FPS = VIDEO_W, VIDEO_H, FPS
-BF_MODES = ["battle_royale", "color_infection", "gravity_race"]
-BF_PATTERNS = ["solid", "stripes", "dots", "eyes"]
+BF_MODES = ["duel_1v1", "group_battle", "boss_battle", "color_infection", "gravity_race", "spike_accumulator"]
+BF_PATTERNS = ["solid", "stripes", "dots", "eyes", "gradient", "neon"]
 
 
 def _bf_vivid_color(h: float, s: float = 0.85, v: float = 0.98) -> tuple:
@@ -2502,6 +672,17 @@ def _bf_make_sprite(diameter: int, color: tuple, pattern: str, rng: random.Rando
                        fill=(20, 20, 20, 255))
         dr.arc([ex - er * 1.6, ey + er * 0.5, ex + er * 1.6, ey + er * 2.4],
                start=15, end=165, fill=(30, 30, 30, 255), width=max(2, int(ss * 1.1)))
+    elif pattern == "gradient":
+        cx, cy = d * ss / 2, d * ss / 2
+        for s in range(6, 0, -1):
+            frac = s / 6
+            rr = (d * ss / 2 - pad) * frac
+            light = tuple(min(255, int(c + (255 - c) * 0.55 * (1 - frac))) for c in color)
+            dr.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=light + (255,))
+    elif pattern == "neon":
+        cx, cy = d * ss / 2, d * ss / 2
+        for rr, alpha in ((d * ss * 0.42, 55), (d * ss * 0.30, 95), (d * ss * 0.16, 160)):
+            dr.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=(255, 255, 255, alpha))
     return big.resize((d, d), Image.LANCZOS)
 
 
@@ -2513,6 +694,101 @@ def _bf_ffmpeg_writer(path: str, w: int, h: int, fps: int) -> subprocess.Popen:
          "-pix_fmt", "yuv420p", path],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# VISUAL STYLE SYSTEM — rotates between distinct looks per video, modeled
+# on real viral "ball battle" formats: pastel mobile-game HUD (big HP
+# numbers, thick black arena), dark neon with permanent bounce-trail webs,
+# and a neon hybrid with segmented pip health bars + VS title cards.
+# ─────────────────────────────────────────────────────────────────────
+
+BF_VISUAL_STYLES = {
+    "pastel_hud": {
+        "bg": (250, 240, 200), "arena": "square", "border_color": (25, 25, 25),
+        "border_w": 7, "hp": "number", "text_color": (25, 25, 25),
+        "text_outline": (255, 255, 255),
+    },
+    "dark_web": {
+        "bg": (6, 6, 10), "arena": "circle_thin", "border_color": (240, 240, 245),
+        "border_w": 2, "hp": "none", "text_color": (240, 240, 245),
+        "text_outline": (0, 0, 0), "web_trails": True,
+    },
+    "neon_hybrid": {
+        "bg": None, "arena": "circle_glow", "border_color": None,
+        "border_w": 3, "hp": "pips", "text_color": (255, 255, 255),
+        "text_outline": (0, 0, 0),
+    },
+}
+
+
+def _bf_style_background(style: dict, w: int, h: int, bg_hex: str, accent: tuple) -> Image.Image:
+    if style["bg"] is None:
+        return _bf_background(w, h, bg_hex, accent)
+    return Image.new("RGB", (w, h), style["bg"])
+
+
+def _bf_draw_arena(dr: ImageDraw.ImageDraw, style: dict, center: tuple, R: float,
+                   accent: tuple, t: float) -> None:
+    col = style["border_color"] or accent
+    if style["arena"] == "square":
+        dr.rectangle([center[0] - R, center[1] - R, center[0] + R, center[1] + R],
+                    outline=col, width=style["border_w"])
+    elif style["arena"] == "circle_thin":
+        dr.ellipse([center[0] - R, center[1] - R, center[0] + R, center[1] + R],
+                   outline=col, width=style["border_w"])
+    else:  # circle_glow — pulsing colored ring, matches the existing neon branding
+        pulse = 6 + int(4 * math.sin(t * 2))
+        dr.ellipse([center[0] - R - pulse, center[1] - R - pulse,
+                   center[0] + R + pulse, center[1] + R + pulse], outline=accent, width=10)
+        dr.ellipse([center[0] - R, center[1] - R, center[0] + R, center[1] + R],
+                   outline=(255, 255, 255), width=3)
+
+
+def _bf_draw_hp(style: dict, img: Image.Image, dr: ImageDraw.ImageDraw, pos: tuple,
+                r: float, hp_frac: float, color: tuple, width_mult: float = 2.2) -> None:
+    hp_frac = max(0.0, min(1.0, hp_frac))
+    mode = style["hp"]
+    if mode == "none":
+        return
+    if mode == "number":
+        _bf_hud_text(img, (pos[0], pos[1]), str(int(round(hp_frac * 100))), int(r * 0.62),
+                    color=(20, 20, 20) if sum(color) > 400 else (255, 255, 255))
+        return
+    bar_w = r * width_mult
+    x, y = pos[0] - bar_w / 2, pos[1] - r - 24
+    if mode == "pips":
+        n_pips, gap = 5, 3
+        seg_w = (bar_w - gap * (n_pips - 1)) / n_pips
+        filled = round(hp_frac * n_pips)
+        for i in range(n_pips):
+            px = x + i * (seg_w + gap)
+            col = (60, 220, 90) if i < filled else (55, 55, 60)
+            dr.rectangle([px, y, px + seg_w, y + 10], fill=col, outline=(255, 255, 255), width=1)
+        return
+    # fallback: smooth bar
+    dr.rectangle([x, y, x + bar_w, y + 9], fill=(35, 35, 40))
+    barcol = (60, 220, 90) if hp_frac > 0.5 else (240, 195, 40) if hp_frac > 0.25 else (230, 60, 60)
+    dr.rectangle([x, y, x + bar_w * hp_frac, y + 9], fill=barcol)
+    dr.rectangle([x, y, x + bar_w, y + 9], outline=(255, 255, 255), width=1)
+
+
+def _bf_vs_title_card(w: int, h: int, style: dict, left_name: str, left_color: tuple,
+                      right_name: str, right_color: tuple) -> Image.Image:
+    """A few frozen intro frames announcing the matchup, mimicking the
+    clickbait 'X vs Y — who will win?' title cards every reference uses."""
+    img = Image.new("RGB", (w, h), style["bg"] or (8, 8, 12))
+    dr = ImageDraw.Draw(img)
+    ty = h * 0.30
+    _bf_hud_text(img, (w / 2, ty - 90), "WHO WILL WIN?", 56, color=style["text_color"])
+    r = 70
+    lx, rx = w * 0.28, w * 0.72
+    dr.ellipse([lx - r, ty - r, lx + r, ty + r], fill=left_color, outline=(255, 255, 255), width=5)
+    dr.ellipse([rx - r, ty - r, rx + r, ty + r], fill=right_color, outline=(255, 255, 255), width=5)
+    _bf_hud_text(img, (w / 2, ty), "VS", 60, color=style["text_color"])
+    _bf_hud_text(img, (lx, ty + r + 55), left_name.upper(), 38, color=left_color)
+    _bf_hud_text(img, (rx, ty + r + 55), right_name.upper(), 38, color=right_color)
+    return img
 
 
 def _bf_background(w: int, h: int, bg_hex: str, accent: tuple) -> Image.Image:
@@ -2557,114 +833,792 @@ def _bf_paste_sprite(img: Image.Image, sprite: Image.Image, pos: tuple, angle_ra
 
 
 # ─────────────────────────────────────────────────────────────────────
-# MODE 1 — BATTLE ROYALE (shrinking circular arena, elimination)
+# SHARED FX — motion trails + shard-burst "shatter" effect, used by
+# every sim mode below for a punchier, more "satisfying-ball-video" look
 # ─────────────────────────────────────────────────────────────────────
 
-def simulate_battle_royale(target_dur: float, out_path: str, rng: random.Random) -> tuple:
+def _bf_blend(base_bg: tuple, color: tuple, frac: float) -> tuple:
+    frac = max(0.0, min(1.0, frac))
+    return tuple(int(base_bg[k] + (color[k] - base_bg[k]) * frac) for k in range(3))
+
+
+def _bf_update_trail(history: dict, ball_id, pos: tuple, max_len: int = 7) -> None:
+    hist = history.setdefault(ball_id, [])
+    hist.append((pos[0], pos[1]))
+    if len(hist) > max_len:
+        hist.pop(0)
+
+
+def _bf_draw_trails(dr: ImageDraw.ImageDraw, history: dict, colors: dict, radii: dict,
+                    base_bg: tuple) -> None:
+    for bid, hist in history.items():
+        n = len(hist)
+        if n < 2 or bid not in colors:
+            continue
+        color, r = colors[bid], radii[bid]
+        for i, (x, y) in enumerate(hist[:-1]):
+            frac = (i + 1) / n
+            blended = _bf_blend(base_bg, color, 0.30 * frac)
+            rr = max(2, r * 0.55 * frac)
+            dr.ellipse([x - rr, y - rr, x + rr, y + rr], fill=blended)
+
+
+def _bf_spawn_burst(bursts: list, pos: tuple, color: tuple, t: float) -> None:
+    bursts.append({"x": pos[0], "y": pos[1], "color": color, "t0": t})
+
+
+def _bf_draw_bursts(dr: ImageDraw.ImageDraw, bursts: list, t: float, base_bg: tuple,
+                    life: float = 0.32, n_shards: int = 8) -> list:
+    """Draws + prunes active shard-burst effects (a ball 'shattering' into
+    fading fragments); returns the still-active subset."""
+    active = []
+    for burst in bursts:
+        age = t - burst["t0"]
+        if age > life:
+            continue
+        active.append(burst)
+        frac = age / life
+        jitter = (burst["x"] * 0.017) % (2 * math.pi)
+        for k in range(n_shards):
+            ang = (2 * math.pi / n_shards) * k + jitter
+            dist = 8 + frac * 60
+            bx = burst["x"] + math.cos(ang) * dist
+            by = burst["y"] + math.sin(ang) * dist
+            blended = _bf_blend(base_bg, burst["color"], 1 - frac)
+            sz = max(1, 5 * (1 - frac))
+            dr.ellipse([bx - sz, by - sz, bx + sz, by + sz], fill=blended)
+    return active
+
+
+# ─────────────────────────────────────────────────────────────────────
+# COMBAT SYSTEM — abilities, damage resolution, HP bars.
+# Shared by duel_1v1 / group_battle / boss_battle.
+# ─────────────────────────────────────────────────────────────────────
+
+BF_ABILITIES = {
+    "tank":      {"tag": "TANK",  "hp_mult": 1.7,  "speed_mult": 0.78, "dmg_mult": 1.0,  "weapon": "hammer"},
+    "speedster": {"tag": "FAST",  "hp_mult": 0.65, "speed_mult": 1.55, "dmg_mult": 0.7,  "weapon": "dagger"},
+    "bomber":    {"tag": "BOMB",  "hp_mult": 1.0,  "speed_mult": 1.0,  "dmg_mult": 1.0,  "weapon": "bomb"},
+    "vampire":   {"tag": "VAMP",  "hp_mult": 0.9,  "speed_mult": 1.05, "dmg_mult": 0.85, "weapon": "dagger"},
+    "berserker": {"tag": "RAGE",  "hp_mult": 1.0,  "speed_mult": 1.0,  "dmg_mult": 1.0,  "weapon": "mace"},
+    "shield":    {"tag": "GUARD", "hp_mult": 1.0,  "speed_mult": 0.95, "dmg_mult": 1.0,  "weapon": "shield"},
+}
+
+# Pixel-art weapon sprites: small blocky grids drawn as flat-color squares and
+# orbited around each fighter like the "Wrench"/"Orbital" ball-fight reference
+# videos, instead of abstract rings or lines.
+_BF_WEAPON_GRIDS = {
+    "hammer": [
+        "....DDDDDD..", "....DMMMMD..", "....DMMMMD..", "....DMMMMD..",
+        "....DDDDDD..", "......HH....", "......HH....", "......HH....",
+        "......HH....", "......HH....", "......HH....", ".....HHHH...",
+    ],
+    "dagger": [
+        ".......M....", "......MMM...", "......MMM...", "......MMM...",
+        "......MMM...", "......MMM...", "..DGGGGGGGD.", "..DGGGGGGGD.",
+        "......H.....", "......H.....", "......H.....", "......H.....",
+    ],
+    "mace": [
+        "....DD......", "...DMMD.....", "..DMMMMD....", "..DMMMMD....",
+        "..DMMMMD....", "...DMMD.....", "....DD......", ".....H......",
+        ".....H......", ".....H......", ".....H......", ".....H......",
+    ],
+    "bomb": [
+        "......F.....", ".....FD.....", "....OOO.....", "...OBBBO....",
+        "..OBWBBBO...", "..OBWBBBO...", ".OBBBBBBBO..", ".OBBBBBBBO..",
+        ".OBBBBBBBO..", "..OBBBBBO...", "..OBBBBBO...", "...OOOOO....",
+    ],
+    "shield": [
+        "DDDDDDDDDDDD", "DSSSSSSSSSSD", "DSSSSSSSSSSD", "DSSSSSSSSSSD",
+        "DSSSSSSSSSSD", "DSSSSSSSSSSD", ".DSSSSSSSSD.", ".DSSSSSSSSD.",
+        "..DSSSSSSD..", "..DSSSSSSD..", "...DSSSSD...", "....DDDD....",
+    ],
+}
+_BF_WEAPON_COLORS = {
+    "H": (120, 80, 45, 255), "M": (195, 198, 208, 255), "D": (75, 77, 88, 255),
+    "G": (230, 180, 40, 255), "F": (255, 170, 40, 255), "B": (48, 49, 60, 255),
+    "O": (178, 181, 196, 255), "W": (240, 240, 250, 255),
+    "S": (70, 145, 225, 255),
+}
+
+
+def _bf_make_pixel_sprite(grid: list, px: int = 6) -> Image.Image:
+    h, w = len(grid), len(grid[0])
+    img = Image.new("RGBA", (w * px, h * px), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(img)
+    for y, row in enumerate(grid):
+        for x, ch in enumerate(row):
+            if ch != ".":
+                dr.rectangle([x * px, y * px, x * px + px - 1, y * px + px - 1],
+                            fill=_BF_WEAPON_COLORS[ch])
+    return img
+
+
+_BF_WEAPON_SPRITES = {name: _bf_make_pixel_sprite(grid) for name, grid in _BF_WEAPON_GRIDS.items()}
+
+
+def _bf_make_fighter(fid: int, r: float, color: tuple, ability: str, rng: random.Random,
+                     base_hp: float = 100.0) -> dict:
+    ab = BF_ABILITIES[ability]
+    max_hp = base_hp * ab["hp_mult"] * _BF_HP_SCALE
+    return {"id": fid, "r": r, "color": color, "ability": ability,
+            "hp": max_hp, "max_hp": max_hp, "alive": True, "shield_up": ability == "shield",
+            "orbit_n": 1 if ability == "vampire" else 0,
+            "orbit_spin": rng.uniform(0, 2 * math.pi)}
+
+
+def _bf_draw_flat_fighter(dr: ImageDraw.ImageDraw, f: dict) -> None:
+    """Plain flat-fill circle with a white outline — matches how every
+    reference video (airballsfight, battleofballs, bluejason10, shadow_recall)
+    actually renders its fighters, instead of a patterned/textured sprite."""
+    p, r = f["body"].position, f["r"]
+    dr.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=tuple(f["color"]),
+              outline=(255, 255, 255), width=max(2, int(r * 0.06)))
+
+
+def _bf_draw_heart(dr: ImageDraw.ImageDraw, x: float, y: float, s: float,
+                   color: tuple = (255, 55, 95)) -> None:
+    r = s * 0.5
+    dr.ellipse([x - r * 1.6, y - r * 0.8, x - r * 0.2, y + r * 0.8], fill=color)
+    dr.ellipse([x + r * 0.2, y - r * 0.8, x + r * 1.6, y + r * 0.8], fill=color)
+    dr.polygon([(x - r * 1.5, y + r * 0.15), (x + r * 1.5, y + r * 0.15), (x, y + r * 2.0)], fill=color)
+
+
+def _bf_fighter_stat_text(f: dict, t: float) -> str:
+    """A number that visibly climbs over the fight — the exact bottom-HUD
+    quirk from the reference stat-battle videos (Max Speed / Dodge Chance
+    creeping up over time)."""
+    if f["ability"] == "vampire":
+        return f"ORBITS {f['orbit_n']}"
+    return f"PWR {1.0 + t * 0.12:.2f}"
+
+
+def _bf_resolve_clash(a: dict, b: dict, impact_speed: float, t: float,
+                      events: list, bursts: list, mult_a: float = 1.0, mult_b: float = 1.0) -> None:
+    """Both fighters hit each other from the same collision, resolved
+    simultaneously (damage computed from pre-hit HP/shield state for both
+    sides before anything is applied) — so whichever fighter happens to be
+    iterated first doesn't get a free kill before the other can retaliate.
+    mult_a/mult_b scale a's/b's outgoing damage (e.g. a boss hitting harder)."""
+    def compute(attacker, defender, mult):
+        dmg = max(3.0, impact_speed * 0.05) * BF_ABILITIES[attacker["ability"]]["dmg_mult"] * mult
+        if attacker["ability"] == "berserker":
+            dmg *= 1 + (1 - attacker["hp"] / attacker["max_hp"]) * 0.9
+        blocked = defender["ability"] == "shield" and defender["shield_up"]
+        return dmg, blocked
+
+    dmg_a, blocked_b = compute(a, b, mult_a)  # a hits b
+    dmg_b, blocked_a = compute(b, a, mult_b)  # b hits a
+
+    if blocked_b:
+        b["shield_up"] = False
+        events.append({"t": round(t, 2), "type": "block", "id": b["id"], "color": b["color"]})
+        dmg_a = 0
+    if blocked_a:
+        a["shield_up"] = False
+        events.append({"t": round(t, 2), "type": "block", "id": a["id"], "color": a["color"]})
+        dmg_b = 0
+
+    b["hp"] -= dmg_a
+    a["hp"] -= dmg_b
+    if a["ability"] == "vampire" and dmg_a > 0:
+        a["hp"] = min(a["max_hp"], a["hp"] + dmg_a * 0.4)
+        a["orbit_n"] = min(10, a["orbit_n"] + 1)
+    if b["ability"] == "vampire" and dmg_b > 0:
+        b["hp"] = min(b["max_hp"], b["hp"] + dmg_b * 0.4)
+        b["orbit_n"] = min(10, b["orbit_n"] + 1)
+
+    for f in (a, b):
+        if f["hp"] <= 0 and f["alive"]:
+            f["alive"] = False
+            events.append({"t": round(t, 2), "type": "eliminated", "id": f["id"], "color": f["color"]})
+            _bf_spawn_burst(bursts, f["body"].position, f["color"], t)
+
+
+_BF_WEAPON_DMG = 2.4   # base damage of one weapon hit (balance-tested)
+_BF_WEAPON_CD = 0.6    # seconds between hits per attacker/target pair
+_BF_HP_SCALE = 1.5     # global multiplier on every fighter's HP pool
+
+_BF_SPIN = {"tank": 0.065, "speedster": 0.15, "bomber": 0.09, "vampire": 0.10,
+            "berserker": 0.11, "shield": 0.08}
+
+
+def _bf_weapon_slots(f: dict) -> list:
+    """World position, hit radius and angle of every weapon orbiting fighter f."""
+    ability = f["ability"]
+    if ability == "shield" and not f["shield_up"]:
+        return []
+    count = f["orbit_n"] if ability == "vampire" else 1
+    if count <= 0:
+        return []
+    r = f["r"]
+    wsize = max(22, int(r * 1.35))
+    orbit_dist = r + wsize * 0.5 + 8
+    x, y = f["body"].position
+    return [(x + math.cos(f["orbit_spin"] + (2 * math.pi / count) * i) * orbit_dist,
+             y + math.sin(f["orbit_spin"] + (2 * math.pi / count) * i) * orbit_dist,
+             wsize * 0.42, f["orbit_spin"] + (2 * math.pi / count) * i, wsize)
+            for i in range(count)]
+
+
+def _bf_step_weapons(fighters: list) -> None:
+    for f in fighters:
+        rate = _BF_SPIN[f["ability"]]
+        if f["ability"] == "berserker":
+            rate *= 1 + (1 - f["hp"] / f["max_hp"]) * 0.8  # swings faster the angrier it gets
+        f["orbit_spin"] += rate
+
+
+def _bf_weapon_strike(a: dict, d: dict, t: float, events: list, bursts: list, pt: tuple) -> None:
+    dmg = _BF_WEAPON_DMG * BF_ABILITIES[a["ability"]]["dmg_mult"] * a.get("weapon_mult", 1.0)
+    if a["ability"] == "berserker":
+        dmg *= 1 + (1 - a["hp"] / a["max_hp"]) * 0.9
+    if d["ability"] == "shield" and d["shield_up"]:
+        d["shield_up"] = False
+        events.append({"t": round(t, 2), "type": "block", "id": d["id"], "color": d["color"]})
+        return
+    d["hp"] -= dmg
+    if a["ability"] == "vampire":
+        a["hp"] = min(a["max_hp"], a["hp"] + dmg * 0.4)
+        a["orbit_n"] = min(10, a["orbit_n"] + 1)
+    events.append({"t": round(t, 2), "type": "hit", "impact": 0.55})
+    _bf_spawn_burst(bursts, pt, a["color"], t)
+    if d["hp"] <= 0 and d["alive"]:
+        d["alive"] = False
+        events.append({"t": round(t, 2), "type": "eliminated", "id": d["id"], "color": d["color"]})
+        _bf_spawn_burst(bursts, d["body"].position, d["color"], t)
+
+
+def _bf_weapon_hits(fighters: list, enemies_of, t: float, events: list, bursts: list,
+                    cooldowns: dict) -> None:
+    """A weapon that physically touches an enemy ball hurts it — so what you
+    see swinging is what deals the damage (0.5 s cooldown per attacker/target)."""
+    for f in fighters:
+        if not f["alive"]:
+            continue
+        for (wx, wy, wr, _ang, _ws) in _bf_weapon_slots(f):
+            for e in enemies_of(f):
+                if not e["alive"]:
+                    continue
+                ex, ey = e["body"].position
+                if math.hypot(wx - ex, wy - ey) < e["r"] + wr:
+                    key = (f["id"], e["id"])
+                    if t - cooldowns.get(key, -9.0) < _BF_WEAPON_CD:
+                        continue
+                    cooldowns[key] = t
+                    _bf_weapon_strike(f, e, t, events, bursts, (wx, wy))
+
+
+def _bf_cull_dead(space, fighters: list) -> None:
+    """Remove eliminated fighters from the physics world — otherwise their
+    invisible bodies keep bouncing the survivors around."""
+    for f in fighters:
+        if not f["alive"] and not f.get("removed"):
+            space.remove(f["body"], f["shape"])
+            f["removed"] = True
+
+
+def _bf_draw_ability_geo(img: Image.Image, dr: ImageDraw.ImageDraw, f: dict, t: float) -> None:
+    """Pixel-art weapons swinging on a dotted tether around the ball, like the
+    'Wrench'/'Orbital' ball-fight reference videos. Berserker keeps a pulsing
+    rage aura underneath its mace."""
+    r, ability = f["r"], f["ability"]
+    x, y = f["body"].position
+
+    if ability == "berserker":
+        rage = 1 - f["hp"] / f["max_hp"]
+        if rage > 0.15:
+            pulse = int(6 + 10 * rage * (0.6 + 0.4 * math.sin(t * 10)))
+            aura = tuple(min(255, int(c + (255 - c) * 0.3)) for c in (200, 30, 30))
+            dr.ellipse([x - r - pulse, y - r - pulse, x + r + pulse, y + r + pulse],
+                      outline=aura, width=3)
+
+    weapon = _BF_WEAPON_SPRITES[BF_ABILITIES[ability]["weapon"]]
+    flip = 180 if ability == "shield" else 0
+    for i, (wx, wy, _wr, ang, wsize) in enumerate(_bf_weapon_slots(f)):
+        # dotted tether from the ball's edge out to the weapon (pixel squares)
+        sq = max(3, int(r * 0.06))
+        for k in range(4):
+            frac = (k + 0.5) / 4
+            d = r + 2 + (math.hypot(wx - x, wy - y) - r - wsize * 0.35) * frac
+            tx, ty = x + math.cos(ang) * d, y + math.sin(ang) * d
+            dr.rectangle([tx - sq / 2, ty - sq / 2, tx + sq / 2, ty + sq / 2], fill=(90, 92, 104))
+        wobble = 18 * math.sin(t * 7 + i * 1.7)
+        spr = weapon.resize((wsize, wsize), Image.NEAREST)
+        spun = spr.rotate(-math.degrees(ang) - 90 + flip + wobble, resample=Image.NEAREST, expand=True)
+        img.paste(spun, (int(wx - spun.width / 2), int(wy - spun.height / 2)), spun)
+
+
+def _bf_draw_hp_bar(dr: ImageDraw.ImageDraw, pos: tuple, r: float, hp_frac: float,
+                    width_mult: float = 2.2, height: int = 9) -> None:
+    hp_frac = max(0.0, min(1.0, hp_frac))
+    bar_w = r * width_mult
+    x, y = pos[0] - bar_w / 2, pos[1] - r - height - 16
+    dr.rectangle([x, y, x + bar_w, y + height], fill=(35, 35, 40))
+    col = (60, 220, 90) if hp_frac > 0.5 else (240, 195, 40) if hp_frac > 0.25 else (230, 60, 60)
+    dr.rectangle([x, y, x + bar_w * hp_frac, y + height], fill=col)
+    dr.rectangle([x, y, x + bar_w, y + height], outline=(255, 255, 255), width=1)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MODE 1 — 1v1 DUEL (two fighters, HP bars, abilities, last one standing)
+# ─────────────────────────────────────────────────────────────────────
+
+def simulate_duel_1v1(target_dur: float, out_path: str, rng: random.Random, style: dict) -> tuple:
     space = pymunk.Space(); space.gravity = (0, 0)
     center = (BF_W / 2, BF_H * 0.44)
-    r0 = BF_W * 0.46
-    r1 = BF_W * 0.10
-    grace = target_dur * 0.18
-    n = rng.randint(8, 14)
+    R = BF_W * 0.44
     accent = NICHES["ballfight"]["glow"]
+    base_bg_col = style["bg"] or _hex(NICHES["ballfight"]["bg"])
 
-    balls_meta = _bf_gen_balls(n, (32, 46), rng)
-    live = []
-    for bm in balls_meta:
-        mass = (bm["r"] ** 2) * 0.02
-        body = pymunk.Body(mass, pymunk.moment_for_circle(mass, 0, bm["r"]))
-        ang = rng.uniform(0, 2 * math.pi); dist = rng.uniform(0, r0 * 0.55)
-        body.position = (center[0] + math.cos(ang) * dist, center[1] + math.sin(ang) * dist)
-        speed = rng.uniform(140, 260)
+    abilities = rng.sample(list(BF_ABILITIES.keys()), 2)
+    hues = rng.sample([i / 6 for i in range(6)], 2)
+    fighters = []
+    for i in range(2):
+        color = _bf_vivid_color(hues[i])
+        f = _bf_make_fighter(i, 78, color, abilities[i], rng, base_hp=100.0)
+        body = pymunk.Body(3.0, pymunk.moment_for_circle(3.0, 0, f["r"]))
+        ang = i * math.pi
+        body.position = (center[0] + math.cos(ang) * R * 0.5, center[1] + math.sin(ang) * R * 0.5)
+        speed = 170 * BF_ABILITIES[f["ability"]]["speed_mult"]
         vang = rng.uniform(0, 2 * math.pi)
         body.velocity = (math.cos(vang) * speed, math.sin(vang) * speed)
-        shape = pymunk.Circle(body, bm["r"]); shape.elasticity = 0.97; shape.friction = 0.05
+        shape = pymunk.Circle(body, f["r"]); shape.elasticity = 1.0; shape.friction = 0.02
         space.add(body, shape)
-        live.append({**bm, "body": body, "shape": shape, "alive": True})
+        f["body"], f["shape"] = body, shape
+        fighters.append(f)
 
-    def radius_at(t):
-        sudden_death = target_dur - 3.0
-        if t < grace:
-            return r0
-        if t < sudden_death:
-            frac = (t - grace) / max(0.01, sudden_death - grace)
-            return r0 - (r0 - r1) * frac
-        return r1  # hold tight for forced finish
-
-    events = [{"t": 0.0, "type": "start", "n": n}]
-    touching, winner = set(), None
+    events = [{"t": 0.0, "type": "start",
+              "fighters": [{"color": f["color"], "ability": f["ability"]} for f in fighters]}]
+    touching, bursts, trail_hist, web_pts = set(), [], {}, {0: [], 1: []}
     proc = _bf_ffmpeg_writer(out_path, BF_W, BF_H, BF_FPS)
-    bg = _bf_background(BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
     n_frames = int(target_dur * BF_FPS)
+    winner, finish_hold = None, None
+    heart, next_heart_t = None, rng.uniform(3.5, 6.0)
+    weapon_cd = {}
 
-    for f in range(n_frames):
-        t = f / BF_FPS
+    title = _bf_vs_title_card(BF_W, BF_H, style,
+                              BF_ABILITIES[fighters[0]["ability"]]["tag"], fighters[0]["color"],
+                              BF_ABILITIES[fighters[1]["ability"]]["tag"], fighters[1]["color"])
+    for _ in range(int(BF_FPS * 1.4)):
+        proc.stdin.write(np.array(title).tobytes())
+
+    for fr in range(n_frames):
+        t = fr / BF_FPS
+        live = [f for f in fighters if f["alive"]]
+        if len(live) == 2:
+            a, b = live
+            for me, opp in ((a, b), (b, a)):
+                direction = opp["body"].position - me["body"].position
+                if direction.length > 1:
+                    me["body"].velocity += direction.normalized() * 9
+                    cap = 260 * BF_ABILITIES[me["ability"]]["speed_mult"]
+                    if me["body"].velocity.length > cap:
+                        me["body"].velocity = me["body"].velocity.normalized() * cap
         for _ in range(2):
             space.step(1 / (BF_FPS * 2))
-        R = radius_at(t)
-        alive_balls = [b for b in live if b["alive"]]
-        # boundary handling
-        for b in alive_balls:
-            p = b["body"].position
+        live = [f for f in fighters if f["alive"]]
+        for f in live:
+            p = f["body"].position
             d = math.hypot(p[0] - center[0], p[1] - center[1])
-            if d + b["r"] > R:
-                if d + b["r"] > R + b["r"] * 0.7 and len(alive_balls) > 1:
-                    b["alive"] = False
-                    space.remove(b["body"], b["shape"])
-                    events.append({"t": round(t, 2), "type": "eliminated",
-                                    "id": b["id"], "color": b["color"], "left": len(alive_balls) - 1})
-                else:
-                    nx, ny = (p[0] - center[0]) / max(d, 1e-6), (p[1] - center[1]) / max(d, 1e-6)
-                    vx, vy = b["body"].velocity
-                    dot = vx * nx + vy * ny
-                    if dot > 0:
-                        b["body"].velocity = (vx - 2 * dot * nx, vy - 2 * dot * ny)
-        # collision logging (for SFX)
-        alive_balls = [b for b in live if b["alive"]]
-        for i in range(len(alive_balls)):
-            for j in range(i + 1, len(alive_balls)):
-                a, b = alive_balls[i], alive_balls[j]
+            if d + f["r"] > R:
+                nx, ny = (p[0] - center[0]) / max(d, 1e-6), (p[1] - center[1]) / max(d, 1e-6)
+                vx, vy = f["body"].velocity
+                dot = vx * nx + vy * ny
+                if dot > 0:
+                    f["body"].velocity = (vx - 2 * dot * nx, vy - 2 * dot * ny)
+                    web_pts[f["id"]].append((p[0], p[1]))
+        _bf_step_weapons(live)
+        _bf_weapon_hits(live, lambda f: [o for o in live if o is not f], t, events, bursts, weapon_cd)
+        _bf_cull_dead(space, fighters)
+        live = [f for f in fighters if f["alive"]]
+        if len(live) == 2:
+            a, b = live
+            pa, pb = a["body"].position, b["body"].position
+            dist = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+            if dist < a["r"] + b["r"]:
+                if "hit" not in touching:
+                    speed = math.hypot(*a["body"].velocity) + math.hypot(*b["body"].velocity)
+                    events.append({"t": round(t, 2), "type": "hit", "impact": min(1.0, speed / 900)})
+                    _bf_resolve_clash(a, b, speed, t, events, bursts)
+                    touching.add("hit")
+            else:
+                touching.discard("hit")
+
+        live = [f for f in fighters if f["alive"]]
+        if len(live) <= 1 and winner is None:
+            winner = live[0] if live else max(fighters, key=lambda f: f["hp"])
+            events.append({"t": round(t, 2), "type": "winner", "color": winner["color"]})
+            finish_hold = t + 1.8
+
+        if heart is None and winner is None and t >= next_heart_t:
+            heart = {"x": rng.uniform(center[0] - R * 0.55, center[0] + R * 0.55),
+                    "y": rng.uniform(center[1] - R * 0.55, center[1] + R * 0.55)}
+        if heart:
+            for f in live:
+                p = f["body"].position
+                if math.hypot(p[0] - heart["x"], p[1] - heart["y"]) < f["r"] + 22:
+                    f["hp"] = min(f["max_hp"], f["hp"] + f["max_hp"] * 0.18)
+                    events.append({"t": round(t, 2), "type": "heal", "id": f["id"], "color": f["color"]})
+                    heart = None
+                    next_heart_t = t + rng.uniform(4.5, 7.5)
+                    break
+
+        img = bg.copy()
+        dr = ImageDraw.Draw(img)
+        _bf_draw_arena(dr, style, center, R, _hex(accent), t)
+        if style.get("web_trails"):
+            for f in live:
+                pts = web_pts[f["id"]]
+                if pts:
+                    px, py = f["body"].position
+                    for (bx, by) in pts:
+                        dr.line([bx, by, px, py], fill=f["color"], width=2)
+        else:
+            for f in live:
+                _bf_update_trail(trail_hist, f["id"], f["body"].position)
+            _bf_draw_trails(dr, trail_hist, {f["id"]: f["color"] for f in live},
+                            {f["id"]: f["r"] for f in live}, base_bg_col)
+        bursts = _bf_draw_bursts(dr, bursts, t, base_bg_col)
+        if heart:
+            _bf_draw_heart(dr, heart["x"], heart["y"], 30)
+        for f in live:
+            _bf_draw_flat_fighter(dr, f)
+            _bf_draw_ability_geo(img, dr, f, t)
+            _bf_draw_hp(style, img, dr, f["body"].position, f["r"], f["hp"] / f["max_hp"], f["color"])
+            _bf_hud_text(img, (f["body"].position[0], f["body"].position[1] + f["r"] + 34),
+                        BF_ABILITIES[f["ability"]]["tag"], 24, color=f["color"])
+        _bf_hud_text(img, (BF_W / 2, 90), "FIGHT!" if winner is None else "WINNER!", 78,
+                    color=style["text_color"])
+        if style["hp"] == "number":  # pastel_hud — the escalating bottom stat line
+            remaining = max(0, (finish_hold or target_dur) - t)
+            _bf_hud_text(img, (center[0] - R, center[1] + R + 40), f"TIME LEFT: {remaining:.0f}s",
+                        26, color=style["text_color"], anchor="lm")
+            stat_line = "    ".join(_bf_fighter_stat_text(f, t) for f in live)
+            _bf_hud_text(img, (center[0] + R, center[1] + R + 40), stat_line,
+                        26, color=style["text_color"], anchor="rm")
+        proc.stdin.write(np.array(img).tobytes())
+
+        if finish_hold and t >= finish_hold:
+            break
+
+    proc.stdin.close(); proc.wait()
+    if winner is None:
+        winner = max(fighters, key=lambda f: f["hp"])
+        events.append({"t": round(target_dur, 2), "type": "winner", "color": winner["color"]})
+    return events, {"mode": "duel_1v1", "winner_color": winner["color"],
+                     "duration": (finish_hold or target_dur) + 1.4}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MODE 2 — GROUP BATTLE (team vs. team, abilities, HP bars, last team standing)
+# ─────────────────────────────────────────────────────────────────────
+
+def simulate_group_battle(target_dur: float, out_path: str, rng: random.Random, style: dict) -> tuple:
+    space = pymunk.Space(); space.gravity = (0, 0)
+    center = (BF_W / 2, BF_H * 0.44)
+    R = BF_W * 0.45
+    accent = NICHES["ballfight"]["glow"]
+    base_bg_col = style["bg"] or _hex(NICHES["ballfight"]["bg"])
+    per_team = rng.randint(3, 4)
+    team_colors = [_bf_vivid_color(0.0), _bf_vivid_color(0.55)]  # red-ish vs blue-ish, always readable
+
+    fighters, fid = [], 0
+    for i in range(per_team):
+        for team, tcol in enumerate(team_colors):
+            ability = rng.choice(list(BF_ABILITIES.keys()))
+            f = _bf_make_fighter(fid, 40, tcol, ability, rng, base_hp=70.0)
+            f["team"] = team
+            ang = rng.uniform(0, 2 * math.pi); dist = rng.uniform(0, R * 0.6)
+            body = pymunk.Body(1.5, pymunk.moment_for_circle(1.5, 0, f["r"]))
+            body.position = (center[0] + math.cos(ang) * dist, center[1] + math.sin(ang) * dist)
+            speed = rng.uniform(130, 210) * BF_ABILITIES[ability]["speed_mult"]
+            vang = rng.uniform(0, 2 * math.pi)
+            body.velocity = (math.cos(vang) * speed, math.sin(vang) * speed)
+            shape = pymunk.Circle(body, f["r"]); shape.elasticity = 1.0; shape.friction = 0.02
+            space.add(body, shape)
+            f["body"], f["shape"] = body, shape
+            fighters.append(f); fid += 1
+
+    events = [{"t": 0.0, "type": "start", "teams": 2, "n": len(fighters)}]
+    touching, bursts, trail_hist = set(), [], {}
+    web_pts = {f["id"]: [] for f in fighters}
+    weapon_cd = {}
+    proc = _bf_ffmpeg_writer(out_path, BF_W, BF_H, BF_FPS)
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
+    n_frames = int(target_dur * BF_FPS)
+    winner_color, finish_hold = None, None
+
+    title = _bf_vs_title_card(BF_W, BF_H, style, "TEAM RED", team_colors[0], "TEAM BLUE", team_colors[1])
+    for _ in range(int(BF_FPS * 1.4)):
+        proc.stdin.write(np.array(title).tobytes())
+
+    for fr in range(n_frames):
+        t = fr / BF_FPS
+        live = [f for f in fighters if f["alive"]]
+        for f in live:
+            enemies = [e for e in live if e["team"] != f["team"]]
+            if enemies:
+                nearest = min(enemies, key=lambda e: (e["body"].position - f["body"].position).length)
+                direction = nearest["body"].position - f["body"].position
+                if direction.length > 1:
+                    f["body"].velocity += direction.normalized() * 14
+                    cap = 230 * BF_ABILITIES[f["ability"]]["speed_mult"]
+                    if f["body"].velocity.length > cap:
+                        f["body"].velocity = f["body"].velocity.normalized() * cap
+        for _ in range(2):
+            space.step(1 / (BF_FPS * 2))
+        live = [f for f in fighters if f["alive"]]
+        for f in live:
+            p = f["body"].position
+            d = math.hypot(p[0] - center[0], p[1] - center[1])
+            if d + f["r"] > R:
+                nx, ny = (p[0] - center[0]) / max(d, 1e-6), (p[1] - center[1]) / max(d, 1e-6)
+                vx, vy = f["body"].velocity
+                dot = vx * nx + vy * ny
+                if dot > 0:
+                    f["body"].velocity = (vx - 2 * dot * nx, vy - 2 * dot * ny)
+                    web_pts[f["id"]].append((p[0], p[1]))
+        _bf_step_weapons(live)
+        _bf_weapon_hits(live, lambda f: [e for e in live if e["team"] != f["team"]], t, events, bursts, weapon_cd)
+        _bf_cull_dead(space, fighters)
+        live = [f for f in fighters if f["alive"]]
+        for i in range(len(live)):
+            for j in range(i + 1, len(live)):
+                a, b = live[i], live[j]
                 pa, pb = a["body"].position, b["body"].position
                 dist = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
                 key = (a["id"], b["id"])
                 if dist < a["r"] + b["r"]:
+                    if a["team"] == b["team"]:
+                        continue  # friendly bounce, no damage
                     if key not in touching:
                         speed = math.hypot(*a["body"].velocity) + math.hypot(*b["body"].velocity)
-                        events.append({"t": round(t, 2), "type": "collision", "impact": min(1.0, speed / 800)})
+                        _bf_resolve_clash(a, b, speed, t, events, bursts)
                     touching.add(key)
                 else:
                     touching.discard(key)
 
-        if len(alive_balls) == 1 and winner is None:
-            winner = alive_balls[0]
-            events.append({"t": round(t, 2), "type": "winner", "id": winner["id"], "color": winner["color"]})
+        live = [f for f in fighters if f["alive"]]
+        teams_left = {f["team"] for f in live}
+        if winner_color is None and len(teams_left) <= 1:
+            winner_team = next(iter(teams_left)) if teams_left else 0
+            winner_color = list(team_colors[winner_team])
+            events.append({"t": round(t, 2), "type": "winner", "color": winner_color})
+            finish_hold = t + 1.8
 
         img = bg.copy()
         dr = ImageDraw.Draw(img)
-        dr.ellipse([center[0] - R - 6, center[1] - R - 6, center[0] + R + 6, center[1] + R + 6],
-                   outline=_hex(accent), width=10)
-        dr.ellipse([center[0] - R, center[1] - R, center[0] + R, center[1] + R],
-                   outline=(255, 255, 255), width=3)
-        for b in alive_balls:
-            _bf_paste_sprite(img, b["sprite"], b["body"].position, b["body"].angle)
-        left_n = len(alive_balls) if winner is None else 1
-        _bf_hud_text(img, (BF_W / 2, 90), f"{left_n} LEFT" if winner is None else "WINNER!", 78, _hex(accent))
+        _bf_draw_arena(dr, style, center, R, _hex(accent), t)
+        if style.get("web_trails"):
+            for f in live:
+                pts = web_pts[f["id"]]
+                if pts:
+                    px, py = f["body"].position
+                    for (bx, by) in pts:
+                        dr.line([bx, by, px, py], fill=f["color"], width=1)
+        else:
+            for f in live:
+                _bf_update_trail(trail_hist, f["id"], f["body"].position)
+            _bf_draw_trails(dr, trail_hist, {f["id"]: f["color"] for f in live},
+                            {f["id"]: f["r"] for f in live}, base_bg_col)
+        bursts = _bf_draw_bursts(dr, bursts, t, base_bg_col)
+        for f in live:
+            _bf_draw_flat_fighter(dr, f)
+            _bf_draw_ability_geo(img, dr, f, t)
+            _bf_draw_hp(style, img, dr, f["body"].position, f["r"], f["hp"] / f["max_hp"], f["color"],
+                       width_mult=1.8)
+        n0 = sum(1 for f in live if f["team"] == 0); n1 = sum(1 for f in live if f["team"] == 1)
+        _bf_hud_text(img, (BF_W / 2, 90),
+                    f"{n0} vs {n1}" if winner_color is None else "WINNER!", 68, color=style["text_color"])
         proc.stdin.write(np.array(img).tobytes())
 
+        if finish_hold and t >= finish_hold:
+            break
+
     proc.stdin.close(); proc.wait()
-    if winner is None and live:
-        winner = max((b for b in live), key=lambda b: b["alive"])
-        events.append({"t": target_dur, "type": "winner", "id": winner["id"], "color": winner["color"]})
-    return events, {"mode": "battle_royale", "winner_color": winner["color"] if winner else None,
-                     "n_balls": n, "duration": target_dur}
+    if winner_color is None:
+        live = [f for f in fighters if f["alive"]]
+        def team_score(team):
+            members = [f for f in live if f["team"] == team]
+            return (len(members), sum(f["hp"] for f in members))
+        best_team = max((0, 1), key=team_score)
+        winner_color = list(team_colors[best_team])
+        events.append({"t": round(target_dur, 2), "type": "winner", "color": winner_color})
+    return events, {"mode": "group_battle", "winner_color": winner_color,
+                     "n_balls": len(fighters), "duration": (finish_hold or target_dur) + 1.4}
 
 
 # ─────────────────────────────────────────────────────────────────────
-# MODE 2 — COLOR INFECTION (team paint-tag, non-elimination)
+# MODE 3 — BOSS BATTLE (one huge boss vs. a team of heroes, boss HP bar
+# up top, heroes must bring it down before it wipes the team)
 # ─────────────────────────────────────────────────────────────────────
 
-def simulate_color_infection(target_dur: float, out_path: str, rng: random.Random) -> tuple:
+def simulate_boss_battle(target_dur: float, out_path: str, rng: random.Random, style: dict) -> tuple:
+    space = pymunk.Space(); space.gravity = (0, 0)
+    center = (BF_W / 2, BF_H * 0.46)
+    R = BF_W * 0.46
+    accent = NICHES["ballfight"]["glow"]
+    base_bg_col = style["bg"] or _hex(NICHES["ballfight"]["bg"])
+    boss_color = (215, 30, 40)
+
+    n_heroes = rng.randint(4, 6)
+    boss = _bf_make_fighter(0, 150, boss_color, "tank", rng, base_hp=n_heroes * 58.0)
+    boss["team"] = "boss"
+    boss["weapon_mult"] = 1.4
+    bbody = pymunk.Body(20.0, pymunk.moment_for_circle(20.0, 0, boss["r"]))
+    bbody.position = center
+    bbody.velocity = (rng.choice([-1, 1]) * 90, rng.choice([-1, 1]) * 90)
+    bshape = pymunk.Circle(bbody, boss["r"]); bshape.elasticity = 1.0; bshape.friction = 0.02
+    space.add(bbody, bshape)
+    boss["body"], boss["shape"] = bbody, bshape
+
+    heroes = []
+    hero_hue = rng.random()
+    for i in range(n_heroes):
+        ability = rng.choice(list(BF_ABILITIES.keys()))
+        color = _bf_vivid_color(hero_hue + i * 0.11)
+        h = _bf_make_fighter(i + 1, 34, color, ability, rng, base_hp=100.0)
+        h["team"] = "hero"
+        ang = rng.uniform(0, 2 * math.pi); dist = R * rng.uniform(0.55, 0.8)
+        body = pymunk.Body(1.2, pymunk.moment_for_circle(1.2, 0, h["r"]))
+        body.position = (center[0] + math.cos(ang) * dist, center[1] + math.sin(ang) * dist)
+        speed = rng.uniform(160, 240) * BF_ABILITIES[ability]["speed_mult"]
+        vang = rng.uniform(0, 2 * math.pi)
+        body.velocity = (math.cos(vang) * speed, math.sin(vang) * speed)
+        shape = pymunk.Circle(body, h["r"]); shape.elasticity = 1.0; shape.friction = 0.02
+        space.add(body, shape)
+        h["body"], h["shape"] = body, shape
+        heroes.append(h)
+
+    events = [{"t": 0.0, "type": "start", "n": n_heroes + 1}]
+    touching, bursts, trail_hist = set(), [], {}
+    weapon_cd = {}
+    proc = _bf_ffmpeg_writer(out_path, BF_W, BF_H, BF_FPS)
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
+    n_frames = int(target_dur * BF_FPS)
+    outcome, finish_hold = None, None  # "heroes" or "boss"
+
+    title = _bf_vs_title_card(BF_W, BF_H, style, "HEROES", heroes[0]["color"], "BOSS", boss_color)
+    for _ in range(int(BF_FPS * 1.4)):
+        proc.stdin.write(np.array(title).tobytes())
+
+    for fr in range(n_frames):
+        t = fr / BF_FPS
+        # gentle homing force so the boss actively hunts the nearest hero
+        live_heroes = [h for h in heroes if h["alive"]]
+        if live_heroes and boss["alive"]:
+            nearest = min(live_heroes, key=lambda h: (h["body"].position - bbody.position).length)
+            direction = (nearest["body"].position - bbody.position)
+            if direction.length > 1:
+                direction = direction.normalized()
+                bbody.velocity += direction * 14
+                speed_cap = 130
+                if bbody.velocity.length > speed_cap:
+                    bbody.velocity = bbody.velocity.normalized() * speed_cap
+        if boss["alive"]:
+            for h in live_heroes:
+                to_boss = bbody.position - h["body"].position
+                if to_boss.length > 1:
+                    h["body"].velocity += to_boss.normalized() * 10
+                    hcap = 210 * BF_ABILITIES[h["ability"]]["speed_mult"]
+                    if h["body"].velocity.length > hcap:
+                        h["body"].velocity = h["body"].velocity.normalized() * hcap
+        for _ in range(2):
+            space.step(1 / (BF_FPS * 2))
+
+        all_live = ([boss] if boss["alive"] else []) + [h for h in heroes if h["alive"]]
+        for f in all_live:
+            p = f["body"].position
+            d = math.hypot(p[0] - center[0], p[1] - center[1])
+            if d + f["r"] > R:
+                nx, ny = (p[0] - center[0]) / max(d, 1e-6), (p[1] - center[1]) / max(d, 1e-6)
+                vx, vy = f["body"].velocity
+                dot = vx * nx + vy * ny
+                if dot > 0:
+                    f["body"].velocity = (vx - 2 * dot * nx, vy - 2 * dot * ny)
+
+        now_live = ([boss] if boss["alive"] else []) + [h for h in heroes if h["alive"]]
+        _bf_step_weapons(now_live)
+        _bf_weapon_hits(now_live,
+                        lambda f: ([boss] if boss["alive"] else []) if f["team"] == "hero"
+                        else [h for h in heroes if h["alive"]],
+                        t, events, bursts, weapon_cd)
+        _bf_cull_dead(space, [boss] + heroes)
+        live_heroes = [h for h in heroes if h["alive"]]
+        if boss["alive"]:
+            for h in live_heroes:
+                pa, pb = boss["body"].position, h["body"].position
+                dist = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+                key = ("boss", h["id"])
+                if dist < boss["r"] + h["r"]:
+                    if key not in touching:
+                        speed = math.hypot(*boss["body"].velocity) + math.hypot(*h["body"].velocity)
+                        _bf_resolve_clash(boss, h, speed, t, events, bursts, mult_a=1.1, mult_b=1.0)
+                    touching.add(key)
+                else:
+                    touching.discard(key)
+        live_heroes = [h for h in heroes if h["alive"]]
+
+        live_heroes = [h for h in heroes if h["alive"]]
+        if outcome is None:
+            if not boss["alive"]:
+                outcome = "heroes"
+                win_color_now = live_heroes[0]["color"] if live_heroes else heroes[0]["color"]
+                events.append({"t": round(t, 2), "type": "winner", "color": list(win_color_now)})
+                finish_hold = t + 2.0
+            elif not live_heroes:
+                outcome = "boss"
+                events.append({"t": round(t, 2), "type": "winner", "color": list(boss_color)})
+                finish_hold = t + 2.0
+
+        img = bg.copy()
+        dr = ImageDraw.Draw(img)
+        _bf_draw_arena(dr, style, center, R, _hex(accent), t)
+        for f in ([boss] if boss["alive"] else []) + live_heroes:
+            _bf_update_trail(trail_hist, f["id"], f["body"].position)
+        _bf_draw_trails(dr, trail_hist,
+                        {f["id"]: f["color"] for f in ([boss] if boss["alive"] else []) + live_heroes},
+                        {f["id"]: f["r"] for f in ([boss] if boss["alive"] else []) + live_heroes}, base_bg_col)
+        bursts = _bf_draw_bursts(dr, bursts, t, base_bg_col)
+        for h in live_heroes:
+            _bf_draw_flat_fighter(dr, h)
+            _bf_draw_ability_geo(img, dr, h, t)
+            _bf_draw_hp(style, img, dr, h["body"].position, h["r"], h["hp"] / h["max_hp"], h["color"],
+                       width_mult=1.8)
+        if boss["alive"]:
+            _bf_draw_flat_fighter(dr, boss)
+            _bf_draw_ability_geo(img, dr, boss, t)
+        # big boss HP bar across the top — classic boss-fight UI, kept consistent across all styles
+        bx0, bx1, by = 60, BF_W - 60, 140
+        boss_frac = max(0.0, boss["hp"] / boss["max_hp"])
+        dr.rectangle([bx0, by, bx1, by + 26], fill=(35, 35, 40))
+        dr.rectangle([bx0, by, bx0 + (bx1 - bx0) * boss_frac, by + 26], fill=(215, 40, 50))
+        dr.rectangle([bx0, by, bx1, by + 26], outline=(255, 255, 255), width=2)
+        _bf_hud_text(img, (BF_W / 2, 115), "BOSS", 34, color=style["text_color"])
+        _bf_hud_text(img, (BF_W / 2, 200),
+                    f"{len(live_heroes)} HEROES LEFT" if outcome is None else
+                    ("HEROES WIN!" if outcome == "heroes" else "BOSS WINS!"), 46, color=style["text_color"])
+        proc.stdin.write(np.array(img).tobytes())
+
+        if finish_hold and t >= finish_hold:
+            break
+
+    proc.stdin.close(); proc.wait()
+    if outcome is None:
+        outcome = "heroes" if live_heroes else "boss"
+    win_color = list(heroes[0]["color"]) if outcome == "heroes" and heroes else list(boss_color)
+    return events, {"mode": "boss_battle", "winner_color": win_color,
+                     "winner_label": "HEROES WIN!" if outcome == "heroes" else "BOSS WINS!",
+                     "duration": (finish_hold or target_dur) + 1.4}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MODE 4 — COLOR INFECTION (team paint-tag, non-elimination)
+# ─────────────────────────────────────────────────────────────────────
+
+def simulate_color_infection(target_dur: float, out_path: str, rng: random.Random, style: dict) -> tuple:
     space = pymunk.Space(); space.gravity = (0, 0)
     center = (BF_W / 2, BF_H * 0.42)
     R = BF_W * 0.44
@@ -2691,8 +1645,10 @@ def simulate_color_infection(target_dur: float, out_path: str, rng: random.Rando
     total = len(balls)
     events = [{"t": 0.0, "type": "start", "teams": n_teams, "n": total}]
     touching = set()
+    trail_hist = {}
+    base_bg_col = style["bg"] or _hex(NICHES["ballfight"]["bg"])
     proc = _bf_ffmpeg_writer(out_path, BF_W, BF_H, BF_FPS)
-    bg = _bf_background(BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
     n_frames = int(target_dur * BF_FPS)
     sudden_death = target_dur - 4.0
 
@@ -2734,8 +1690,12 @@ def simulate_color_infection(target_dur: float, out_path: str, rng: random.Rando
 
         img = bg.copy()
         dr = ImageDraw.Draw(img)
-        dr.ellipse([center[0] - R - 6, center[1] - R - 6, center[0] + R + 6, center[1] + R + 6],
-                   outline=_hex(accent), width=10)
+        _bf_draw_arena(dr, style, center, R, _hex(accent), t)
+        for b in balls:
+            _bf_update_trail(trail_hist, b["id"], b["body"].position)
+        _bf_draw_trails(dr, trail_hist,
+                        {b["id"]: b["color"] for b in balls},
+                        {b["id"]: b["r"] for b in balls}, base_bg_col)
         for b in balls:
             p = b["body"].position; r = b["r"]
             dr.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=tuple(b["color"]),
@@ -2763,7 +1723,7 @@ def simulate_color_infection(target_dur: float, out_path: str, rng: random.Rando
 # MODE 3 — GRAVITY RACE (pachinko drop race)
 # ─────────────────────────────────────────────────────────────────────
 
-def simulate_gravity_race(target_dur: float, out_path: str, rng: random.Random) -> tuple:
+def simulate_gravity_race(target_dur: float, out_path: str, rng: random.Random, style: dict) -> tuple:
     space = pymunk.Space(); space.gravity = (0, 1500)
     margin = 60
     accent = NICHES["ballfight"]["glow"]
@@ -2805,11 +1765,14 @@ def simulate_gravity_race(target_dur: float, out_path: str, rng: random.Random) 
                       "dropped": False, "finished": False, "drop_t": i * 0.18})
 
     events = [{"t": 0.0, "type": "start", "n": n}]
+    trail_hist = {}
+    base_bg_col = style["bg"] or _hex(NICHES["ballfight"]["bg"])
     proc = _bf_ffmpeg_writer(out_path, BF_W, BF_H, BF_FPS)
-    bg = _bf_background(BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
     n_frames = int(target_dur * BF_FPS)
     winner = None
     finish_hold = None
+    peg_color = style["border_color"] if style["arena"] == "square" else (130, 130, 150)
 
     for f in range(n_frames):
         t = f / BF_FPS
@@ -2833,15 +1796,19 @@ def simulate_gravity_race(target_dur: float, out_path: str, rng: random.Random) 
         img = bg.copy()
         dr = ImageDraw.Draw(img)
         for (x, y) in peg_positions:
-            dr.ellipse([x - 9, y - 9, x + 9, y + 9], fill=(130, 130, 150))
+            dr.ellipse([x - 9, y - 9, x + 9, y + 9], fill=peg_color)
         dr.line([(margin, finish_y), (BF_W - margin, finish_y)], fill=_hex(accent), width=6)
-        _bf_hud_text(img, (BF_W / 2, finish_y - 30), "FINISH", 42, _hex(accent))
-        for b in balls:
-            if not b["dropped"]:
-                continue
+        _bf_hud_text(img, (BF_W / 2, finish_y - 30), "FINISH", 42, color=style["text_color"])
+        dropped_balls = [b for b in balls if b["dropped"]]
+        for b in dropped_balls:
+            _bf_update_trail(trail_hist, b["id"], b["body"].position, max_len=9)
+        _bf_draw_trails(dr, trail_hist,
+                        {b["id"]: b["color"] for b in dropped_balls},
+                        {b["id"]: b["r"] for b in dropped_balls}, base_bg_col)
+        for b in dropped_balls:
             _bf_paste_sprite(img, b["sprite"], b["body"].position, b["body"].angle)
         if winner:
-            _bf_hud_text(img, (BF_W / 2, 90), "WINNER!", 78, _hex(accent))
+            _bf_hud_text(img, (BF_W / 2, 90), "WINNER!", 78, color=style["text_color"])
         proc.stdin.write(np.array(img).tobytes())
 
         if finish_hold and t >= finish_hold:
@@ -2852,13 +1819,153 @@ def simulate_gravity_race(target_dur: float, out_path: str, rng: random.Random) 
                      "n_balls": n, "duration": (finish_hold or target_dur)}
 
 
-BF_SIM_FUNCS = {"battle_royale": simulate_battle_royale,
+# ─────────────────────────────────────────────────────────────────────
+# MODE 4 — SPIKE ACCUMULATOR (touch the spiked ring, freeze in place —
+# inspired by ballsimulator.com's "Accumulation" mode: tension builds as
+# balls stick to the spikes one by one; last color still moving wins)
+# ─────────────────────────────────────────────────────────────────────
+
+def simulate_spike_accumulator(target_dur: float, out_path: str, rng: random.Random, style: dict) -> tuple:
+    space = pymunk.Space(); space.gravity = (0, 0)
+    center = (BF_W / 2, BF_H * 0.44)
+    r0 = BF_W * 0.46
+    r1 = BF_W * 0.20
+    grace = target_dur * 0.15
+    sudden_death = target_dur - 3.0
+    n_teams = rng.choice([3, 4])
+    per_team = rng.randint(3, 5)
+    team_colors = [_bf_vivid_color(i / n_teams) for i in range(n_teams)]
+    accent = NICHES["ballfight"]["glow"]
+
+    def radius_at(t):
+        if t < grace:
+            return r0
+        if t < sudden_death:
+            frac = (t - grace) / max(0.01, sudden_death - grace)
+            return r0 - (r0 - r1) * frac
+        return r1
+
+    balls, bid = [], 0
+    for tcol in team_colors:
+        for _ in range(per_team):
+            r = rng.uniform(26, 32)
+            body = pymunk.Body(1.0, pymunk.moment_for_circle(1.0, 0, r))
+            ang = rng.uniform(0, 2 * math.pi); dist = rng.uniform(0, r0 * 0.5)
+            body.position = (center[0] + math.cos(ang) * dist, center[1] + math.sin(ang) * dist)
+            speed = rng.uniform(150, 260); vang = rng.uniform(0, 2 * math.pi)
+            body.velocity = (math.cos(vang) * speed, math.sin(vang) * speed)
+            shape = pymunk.Circle(body, r); shape.elasticity = 0.98; shape.friction = 0.02
+            space.add(body, shape)
+            balls.append({"id": bid, "r": r, "color": list(tcol), "body": body, "shape": shape,
+                          "frozen": False, "frozen_pos": None})
+            bid += 1
+
+    total = len(balls)
+    events = [{"t": 0.0, "type": "start", "teams": n_teams, "n": total}]
+    touching, bursts, trail_hist = set(), [], {}
+    base_bg_col = style["bg"] or _hex(NICHES["ballfight"]["bg"])
+    proc = _bf_ffmpeg_writer(out_path, BF_W, BF_H, BF_FPS)
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], _hex(accent))
+    n_frames = int(target_dur * BF_FPS)
+    winner_color, finish_hold = None, None
+
+    def colors_free():
+        return {tuple(b["color"]) for b in balls if not b["frozen"]}
+
+    for f in range(n_frames):
+        t = f / BF_FPS
+        for _ in range(2):
+            space.step(1 / (BF_FPS * 2))
+        R = radius_at(t)
+        n_spikes = max(18, int(R / 13))
+        free_balls = [b for b in balls if not b["frozen"]]
+        for b in free_balls:
+            p = b["body"].position
+            d = math.hypot(p[0] - center[0], p[1] - center[1])
+            if d + b["r"] > R:
+                nx, ny = (p[0] - center[0]) / max(d, 1e-6), (p[1] - center[1]) / max(d, 1e-6)
+                snap_d = R - b["r"] * 0.3
+                frozen_pos = (center[0] + nx * snap_d, center[1] + ny * snap_d)
+                b["frozen"] = True; b["frozen_pos"] = frozen_pos
+                space.remove(b["body"], b["shape"])
+                _bf_spawn_burst(bursts, frozen_pos, b["color"], t)
+                events.append({"t": round(t, 2), "type": "frozen", "id": b["id"], "color": b["color"]})
+
+        free_balls = [b for b in balls if not b["frozen"]]
+        for i in range(len(free_balls)):
+            for j in range(i + 1, len(free_balls)):
+                a, b2 = free_balls[i], free_balls[j]
+                pa, pb = a["body"].position, b2["body"].position
+                dist = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+                key = (a["id"], b2["id"])
+                if dist < a["r"] + b2["r"]:
+                    if key not in touching:
+                        speed = math.hypot(*a["body"].velocity) + math.hypot(*b2["body"].velocity)
+                        events.append({"t": round(t, 2), "type": "collision", "impact": min(1.0, speed / 800)})
+                    touching.add(key)
+                else:
+                    touching.discard(key)
+
+        remaining = colors_free()
+        if winner_color is None and len(remaining) <= 1 and t > 1.0:
+            winner_color = list(next(iter(remaining))) if remaining else balls[-1]["color"]
+            events.append({"t": round(t, 2), "type": "winner", "color": winner_color})
+            finish_hold = t + 2.2
+
+        img = bg.copy()
+        dr = ImageDraw.Draw(img)
+        dr.ellipse([center[0] - R, center[1] - R, center[0] + R, center[1] + R],
+                   outline=(255, 255, 255), width=3)
+        for i in range(n_spikes):
+            ang = 2 * math.pi * i / n_spikes + t * 0.15
+            x1 = center[0] + math.cos(ang) * R
+            y1 = center[1] + math.sin(ang) * R
+            x2 = center[0] + math.cos(ang) * (R + 16)
+            y2 = center[1] + math.sin(ang) * (R + 16)
+            dr.line([x1, y1, x2, y2], fill=_hex(accent), width=4)
+        for b in balls:
+            if b["frozen"]:
+                fx, fy = b["frozen_pos"]
+                dr.ellipse([fx - b["r"], fy - b["r"], fx + b["r"], fy + b["r"]],
+                          fill=tuple(b["color"]), outline=(255, 255, 255), width=2)
+        for b in free_balls:
+            _bf_update_trail(trail_hist, b["id"], b["body"].position)
+        _bf_draw_trails(dr, trail_hist,
+                        {b["id"]: b["color"] for b in free_balls},
+                        {b["id"]: b["r"] for b in free_balls}, base_bg_col)
+        bursts = _bf_draw_bursts(dr, bursts, t, base_bg_col)
+        for b in free_balls:
+            p = b["body"].position; r = b["r"]
+            dr.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=tuple(b["color"]),
+                       outline=(255, 255, 255), width=2)
+        _bf_hud_text(img, (BF_W / 2, 90),
+                    f"{len(free_balls)} FREE" if winner_color is None else "WINNER!", 68,
+                    color=style["text_color"])
+        proc.stdin.write(np.array(img).tobytes())
+
+        if finish_hold and t >= finish_hold:
+            break
+
+    proc.stdin.close(); proc.wait()
+    if winner_color is None:
+        remaining = colors_free()
+        winner_color = list(next(iter(remaining))) if remaining else (balls[0]["color"] if balls else None)
+        events.append({"t": target_dur, "type": "winner", "color": winner_color})
+    return events, {"mode": "spike_accumulator", "winner_color": winner_color,
+                     "n_balls": total, "n_teams": n_teams, "duration": (finish_hold or target_dur)}
+
+
+BF_SIM_FUNCS = {"duel_1v1": simulate_duel_1v1,
+                "group_battle": simulate_group_battle,
+                "boss_battle": simulate_boss_battle,
                 "color_infection": simulate_color_infection,
-                "gravity_race": simulate_gravity_race}
+                "gravity_race": simulate_gravity_race,
+                "spike_accumulator": simulate_spike_accumulator}
 
 
 # ─────────────────────────────────────────────────────────────────────
-# DYNAMIC MUSIC — 4 distinct synthesized moods, one picked at random
+# MUSIC — 4 distinct synthesized moods, one picked at random per video
+# (epic is always part of the pool)
 # ─────────────────────────────────────────────────────────────────────
 
 def _bf_synth_arcade_chiptune(path: str, dur_s: float, rng: random.Random) -> None:
@@ -2882,7 +1989,7 @@ def _bf_synth_arcade_chiptune(path: str, dur_s: float, rng: random.Random) -> No
 
 def _bf_synth_epic_hype(path: str, dur_s: float, rng: random.Random) -> None:
     sr = 44100; n = int(sr * dur_s); t = np.linspace(0, dur_s, n)
-    root = rng.choice([82.4, 98.0, 110.0])
+    root = rng.choice([65.4, 73.4, 82.4, 87.3, 98.0, 110.0])
     pulse = 0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 2.2 * t))
     wave = (0.35 * np.sin(2 * np.pi * root * t) + 0.2 * np.sin(2 * np.pi * root * 2 * t)) * pulse
     wave += 0.12 * np.sin(2 * np.pi * root * 4 * t)
@@ -2949,12 +2056,13 @@ def _bf_make_blip_segment(freq: float, dur: float = 0.09) -> AudioSegment:
     return AudioSegment(wave.tobytes(), frame_rate=sr, sample_width=2, channels=1)
 
 
-def mix_ballfight_audio(events: list, video_dur: float, voice_path: str,
+def mix_ballfight_audio(events: list, total_dur: float, voice_lines: list,
                         music_path: str, tmp_dir: Path) -> str:
-    """Layer synthesized collision/elimination blips + looped ducked music
-    under the narration, matched to real event timestamps."""
-    voice = AudioSegment.from_file(voice_path)
-    bed = AudioSegment.silent(duration=int(video_dur * 1000) + 3000)
+    """Layer synthesized collision/elimination blips + a looped ducked epic
+    music bed, then overlay each short commentary burst at its resolved
+    timestamp (bursts are sparse — most of the runtime stays music+SFX only,
+    not continuously narrated)."""
+    bed = AudioSegment.silent(duration=int(total_dur * 1000) + 500)
 
     music = AudioSegment.from_file(music_path)
     music = (music * (int(len(bed) / len(music)) + 1))[:len(bed)]
@@ -2963,12 +2071,13 @@ def mix_ballfight_audio(events: list, video_dur: float, voice_path: str,
 
     rng = random.Random()
     for ev in events:
-        if ev["type"] not in ("collision", "eliminated", "convert", "finish", "winner"):
+        if ev["type"] not in ("collision", "eliminated", "convert", "finish", "winner", "frozen", "hit", "block", "heal"):
             continue
         base_freq = {"collision": 520, "eliminated": 220, "convert": 700,
-                     "finish": 380, "winner": 300}[ev["type"]]
+                     "finish": 380, "winner": 300, "frozen": 260, "hit": 460, "block": 640,
+                     "heal": 880}[ev["type"]]
         freq = base_freq * rng.uniform(0.85, 1.25)
-        dur = 0.22 if ev["type"] in ("eliminated", "winner") else 0.09
+        dur = 0.22 if ev["type"] in ("eliminated", "winner", "frozen", "heal") else 0.09
         blip = _bf_make_blip_segment(freq, dur)
         impact = ev.get("impact", 0.7)
         blip = blip + (6 * impact - 6)  # louder on harder impacts
@@ -2976,49 +2085,62 @@ def mix_ballfight_audio(events: list, video_dur: float, voice_path: str,
         if pos_ms < len(bed):
             bed = bed.overlay(blip, position=pos_ms)
 
-    bed = bed.overlay(voice)
+    for line in voice_lines:
+        voice = AudioSegment.from_file(line["path"])
+        # duck the music a bit further under each spoken burst so it's clear
+        pos_ms = int(line["start_s"] * 1000)
+        if pos_ms < len(bed):
+            bed = bed.overlay(voice, position=pos_ms)
+
     out_path = str(tmp_dir / "ballfight_audio.mp3")
     bed.export(out_path, format="mp3")
     return out_path
 
 
 # ─────────────────────────────────────────────────────────────────────
-# COMMENTARY — funny sports-caster script generated from real events
+# COMMENTARY — a handful of short reaction bursts tied to real events,
+# plus one closing line for the winner/CTA end card
 # ─────────────────────────────────────────────────────────────────────
 
 def generate_ballfight_commentary(mode: str, events: list, meta: dict, target_dur: float) -> dict:
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
     key_events = [e for e in events if e["type"] in
-                  ("start", "eliminated", "convert", "finish", "winner")][:24]
+                  ("start", "eliminated", "convert", "finish", "winner", "frozen", "block", "heal")][:24]
     event_summary = "\n".join(
         f"- t={e['t']}s: {e['type']}" + (f" (ball/color {e.get('color') or e.get('id')})" if e.get('color') or 'id' in e else "")
         for e in key_events
     )
     mode_desc = {
-        "battle_royale": "a shrinking-arena ball battle royale — balls get eliminated as the ring closes in, last ball wins",
+        "duel_1v1": "a 1v1 duel between two balls, each with a random combat ability, fighting with HP bars until one is knocked out",
+        "group_battle": "a team vs. team ball battle with HP bars and abilities — last team with a fighter standing wins",
+        "boss_battle": "a boss battle — a team of small hero balls vs. one huge boss ball with a big HP bar, heroes win if they bring the boss to 0 HP, boss wins if it wipes the team first",
         "color_infection": "a color-infection game — balls 'infect' each other on contact, one team color takes over the whole arena",
         "gravity_race": "a gravity pachinko drop-race — balls fall through pegs and race to a finish line",
+        "spike_accumulator": "a spike-accumulator game — balls freeze in place the instant they touch the spiked ring, tension builds as fewer stay free, last color with a free ball left wins",
     }[mode]
-
-    target_words = int(target_dur * 2.6)
+    winner_name = meta.get("winner_label") or _bf_color_name(meta.get("winner_color"))
 
     system = (
-        "You write short, genuinely funny sports-commentator voiceover scripts for "
-        "physics-simulation TikTok videos (like satisfying marble-race / ball-battle content). "
-        "Return ONLY valid JSON, no markdown: {title, hashtags: [string], text}. "
-        "Tone: hyped, playful, a little absurd — like a caster who is WAY too invested in some "
-        "bouncing balls. React to the specific events given, in order, but keep it snappy and "
-        "punchy, never a dry play-by-play list. Add jokes, fake stakes, mock-dramatic reactions. "
-        f"Target spoken length: about {target_words} words (~{target_dur:.0f}s). "
+        "You are a hyped sports commentator for physics-simulation TikTok videos "
+        "(satisfying marble-race / ball-battle content). Return ONLY valid JSON, no markdown: "
+        "{title, hashtags: [string], lines: [{t: number, text: string}], winner_line: string}. "
+        "Pick 4 to 6 of the most exciting moments from the real event list and write ONE short, "
+        "punchy reaction line for each (5-12 words, playful/hyped/a little absurd — like a caster "
+        "who is way too invested in some bouncing balls). The 't' value for each line MUST be "
+        "copied EXACTLY from one of the given event timestamps — never invent a new number. "
+        "These lines are short bursts spoken over an otherwise mostly-instrumental video, NOT "
+        "continuous narration — so keep every line short and punchy, not a play-by-play. "
+        "Also write 'winner_line': one hyped line (8-15 words) announcing the winner and telling "
+        f"viewers to follow and like — it plays over the end card announcing: {winner_name}. No timestamp. "
         "title: short catchy TikTok title. hashtags: 6-10 tags mixing #ballfight #satisfying "
         "#physics #fyp with a couple specific to the game mode."
     )
     prompt = (
-        f"Write commentary for {mode_desc}.\n"
+        f"Game mode: {mode_desc}\n"
         f"Real events from this exact simulation, in order:\n{event_summary}\n"
-        "Open with a big hook line, react to eliminations/conversions/finishes as they happen, "
-        "and close with a punchy line about the winner."
+        f"Winner: {winner_name}\n"
+        "Comment on only a handful of the punchiest moments, spaced out across the video."
     )
 
     for attempt in range(4):
@@ -3027,19 +2149,103 @@ def generate_ballfight_commentary(mode: str, events: list, meta: dict, target_du
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": prompt}],
-                temperature=1.0, max_tokens=1200,
+                temperature=1.0, max_tokens=800,
             )
             raw = resp.choices[0].message.content.strip().strip("```json").strip("```").strip()
             data = json.loads(raw)
-            if data.get("text"):
+            lines = [l for l in data.get("lines", [])
+                     if isinstance(l, dict) and l.get("text") and isinstance(l.get("t"), (int, float))]
+            if lines and data.get("winner_line"):
+                data["lines"] = lines
                 return data
         except Exception as e:
             log.warning("Ballfight commentary attempt %d: %s", attempt + 1, e)
         time.sleep(2 ** attempt)
     # Fallback if Groq fails entirely — still produces a postable video
+    mid_t = key_events[len(key_events)//2]["t"] if key_events else target_dur/2
     return {"title": f"Ball {mode.replace('_',' ').title()}!",
             "hashtags": ["ballfight", "satisfying", "physics", "fyp", "foryou"],
-            "text": f"Watch this {mode.replace('_',' ')} play out to the very end. Who wins?"}
+            "lines": [{"t": 0.3, "text": "Here we go!"},
+                      {"t": mid_t, "text": "This is getting intense!"}],
+            "winner_line": f"{winner_name}! Follow for more, and drop a like!"}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# END CARD — "<COLOR> WINS!" + follow/like CTA, held for a few seconds
+# ─────────────────────────────────────────────────────────────────────
+
+_BF_COLOR_NAMES = [
+    (15, "RED"), (45, "ORANGE"), (65, "YELLOW"), (150, "GREEN"),
+    (195, "CYAN"), (250, "BLUE"), (280, "PURPLE"), (325, "PINK"), (360, "RED"),
+]
+
+def _bf_color_name(rgb: Optional[tuple]) -> str:
+    if not rgb:
+        return "EVERYONE"
+    r, g, b = (rgb[0]/255, rgb[1]/255, rgb[2]/255)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    if s < 0.15:
+        return "WHITE" if v > 0.7 else "GRAY"
+    deg = h * 360
+    for hi, name in _BF_COLOR_NAMES:
+        if deg < hi:
+            return name
+    return "RED"
+
+
+def _bf_fit_font_size(text: str, max_width: int, start_size: int, min_size: int = 44) -> int:
+    """Largest font size (down to min_size) at which `text` still fits
+    within max_width, so longer color names don't overflow the canvas."""
+    size = start_size
+    dummy = Image.new("RGB", (1, 1))
+    dr = ImageDraw.Draw(dummy)
+    while size > min_size:
+        font = load_font(size)
+        w = dr.textbbox((0, 0), text, font=font)[2]
+        if w <= max_width:
+            break
+        size -= 6
+    return size
+
+
+def _bf_render_outro_card(winner_color: Optional[tuple], dur_s: float,
+                          out_mp4_path: str, tmp_dir: Path, style: dict,
+                          winner_label: Optional[str] = None) -> str:
+    accent = tuple(winner_color) if winner_color else _hex(NICHES["ballfight"]["glow"])
+    bg = _bf_style_background(style, BF_W, BF_H, NICHES["ballfight"]["bg"], accent)
+    dr = ImageDraw.Draw(bg)
+    cx, cy, r = BF_W / 2, BF_H * 0.36, 150
+    dr.ellipse([cx - r, cy - r, cx + r, cy + r], fill=accent, outline=(255, 255, 255), width=8)
+    if winner_label:
+        title_text = winner_label
+    else:
+        name = _bf_color_name(winner_color)
+        title_text = "IT'S A DRAW!" if name == "EVERYONE" else f"{name} WINS!"
+    title_size = _bf_fit_font_size(title_text, int(BF_W * 0.9), 145)
+    _bf_hud_text(bg, (cx, cy + r + 125), title_text, title_size, color=accent)
+    _bf_hud_text(bg, (cx, cy + r + 250), "FOLLOW + LIKE FOR MORE", 62, color=style["text_color"])
+    png_path = str(tmp_dir / "outro.png")
+    bg.save(png_path)
+    subprocess.run(
+        ["ffmpeg", "-y", "-loop", "1", "-i", png_path, "-t", f"{dur_s:.2f}",
+         "-r", str(BF_FPS), "-pix_fmt", "yuv420p", "-vf", f"scale={BF_W}:{BF_H}",
+         out_mp4_path],
+        check=True, capture_output=True,
+    )
+    return out_mp4_path
+
+
+def _bf_concat_videos(video_paths: list, out_path: str) -> str:
+    args = ["ffmpeg", "-y"]
+    for p in video_paths:
+        args += ["-i", p]
+    n = len(video_paths)
+    filt = "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]"
+    args += ["-filter_complex", filt, "-map", "[outv]",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+              "-pix_fmt", "yuv420p", out_path]
+    subprocess.run(args, check=True, capture_output=True)
+    return out_path
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3048,9 +2254,11 @@ def generate_ballfight_commentary(mode: str, events: list, meta: dict, target_du
 
 def run_ballfight_pipeline() -> None:
     mode = random.choice(BF_MODES)
+    style_name = random.choice(list(BF_VISUAL_STYLES.keys()))
+    style = BF_VISUAL_STYLES[style_name]
     target_dur = random.uniform(24, 36)
     rng = random.Random()
-    log.info("═══ VaultMind Ballfight — mode: %s (~%.0fs) ═══", mode, target_dur)
+    log.info("═══ VaultMind Ballfight — mode: %s, style: %s (~%.0fs) ═══", mode, style_name, target_dur)
 
     ensure_font()
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -3058,165 +2266,75 @@ def run_ballfight_pipeline() -> None:
 
         # 1. Simulate + render silent physics footage
         raw_video = str(tmp / "raw.mp4")
-        events, meta = BF_SIM_FUNCS[mode](target_dur, raw_video, rng)
+        events, meta = BF_SIM_FUNCS[mode](target_dur, raw_video, rng, style)
         real_dur = meta.get("duration", target_dur)
-        log.info("Sim done: %d events, winner=%s", len(events), meta.get("winner_color"))
+        winner_color = meta.get("winner_color")
+        log.info("Sim done: %d events, winner=%s", len(events), winner_color)
 
-        # 2. Funny commentary script from the real event log
-        script  = generate_ballfight_commentary(mode, events, meta, real_dur)
-        title   = script.get("title", "Ball Fight!")
-        hashtags = script.get("hashtags", ["ballfight", "satisfying", "fyp"])
-        text    = script["text"]
+        # 2. Short commentary bursts tied to real events + one winner/CTA line
+        script    = generate_ballfight_commentary(mode, events, meta, real_dur)
+        title     = script.get("title", "Ball Fight!")
+        hashtags  = script.get("hashtags", ["ballfight", "satisfying", "fyp"])
+        raw_lines = script["lines"]
+        winner_text = script["winner_line"]
 
-        # 3. Voiceover (reuses existing ElevenLabs → OpenAI → edge-tts → gTTS chain)
-        voice_path = str(tmp / "voice.mp3")
-        generate_voiceover(text, voice_path)
+        # Snap each line's timestamp to the nearest real event (defends
+        # against the model drifting off the given numbers) and clamp it
+        # inside the sim's actual duration.
+        valid_ts = sorted(e["t"] for e in events)
+        def _snap(t):
+            return min(valid_ts, key=lambda v: abs(v - t)) if valid_ts else 0.0
 
-        # 4. Transcription for captions
-        aai_data = transcribe_with_assemblyai(voice_path)
-        srt_path = str(tmp / "captions.srt")
-        export_srt(aai_data, srt_path)
+        # 3. Synth each burst, resolve non-overlapping start times
+        voice_lines, cur_end = [], 0.0
+        for raw in sorted(raw_lines, key=lambda l: l["t"]):
+            t = min(_snap(raw["t"]), max(0.0, real_dur - 0.6))
+            start = max(t, cur_end + 0.4) if cur_end else t
+            if start >= real_dur - 0.3:
+                continue  # ran out of room before the sim ends — drop it
+            path = str(tmp / f"line_{len(voice_lines)}.mp3")
+            generate_voiceover(raw["text"], path)
+            dur = len(AudioSegment.from_file(path)) / 1000
+            voice_lines.append({"start_s": start, "path": path})
+            cur_end = start + dur
 
-        # 5. Dynamic music mood + collision/elimination SFX, mixed with voice
-        music_path  = str(tmp / "music.mp3")
-        ensure_ballfight_music(real_dur, music_path, rng)
-        audio_path  = mix_ballfight_audio(events, real_dur, voice_path, music_path, tmp)
+        # 4. Winner line — synth first so we know how long the end card
+        #    needs to stay on screen.
+        winner_path = str(tmp / "winner_line.mp3")
+        generate_voiceover(winner_text, winner_path)
+        winner_dur = len(AudioSegment.from_file(winner_path)) / 1000
+        outro_dur  = max(2.6, winner_dur + 1.2)
+        winner_start = real_dur + 0.3
+        voice_lines.append({"start_s": winner_start, "path": winner_path})
 
-        # 6. Mux silent physics video + mixed audio, padding with a frozen
-        #    last frame if the commentary runs longer than the sim.
-        voice_dur = len(AudioSegment.from_file(audio_path)) / 1000
+        # 5. Build the "<COLOR> WINS!" + follow/like end card and append it
+        outro_video = str(tmp / "outro.mp4")
+        _bf_render_outro_card(winner_color, outro_dur, outro_video, tmp, style,
+                              winner_label=meta.get("winner_label"))
+        combined_video = str(tmp / "combined.mp4")
+        _bf_concat_videos([raw_video, outro_video], combined_video)
+        total_dur = real_dur + outro_dur
+
+        # 6. Always-epic music bed + collision/elimination SFX + the sparse
+        #    commentary bursts (incl. winner line), mixed to total_dur.
+        music_path = str(tmp / "music.mp3")
+        ensure_ballfight_music(total_dur, music_path, rng)
+        audio_path = mix_ballfight_audio(events, total_dur, voice_lines, music_path, tmp)
+
+        # 7. Mux video (sim + end card) with the mixed audio bed
         muxed = str(tmp / "muxed.mp4")
-        if voice_dur > real_dur + 0.5:
-            padded = str(tmp / "padded.mp4")
-            pad_s = voice_dur - real_dur + 0.5
-            subprocess.run(["ffmpeg", "-y", "-i", raw_video, "-vf",
-                            f"tpad=stop_mode=clone:stop_duration={pad_s:.2f}",
-                            "-c:v", "libx264", "-preset", "veryfast", padded],
-                           check=True, capture_output=True)
-            raw_video = padded
-        subprocess.run(["ffmpeg", "-y", "-i", raw_video, "-i", audio_path,
+        subprocess.run(["ffmpeg", "-y", "-i", combined_video, "-i", audio_path,
                         "-c:v", "copy", "-c:a", "aac", "-shortest", muxed],
                        check=True, capture_output=True)
 
-        # 7. Animated captions + color grade (reuses existing helpers)
-        captioned = apply_beautiful_captions(
-            video_path=muxed, srt_path=srt_path,
-            output_path=str(tmp / "captioned.mp4"),
-            accent=NICHES["ballfight"]["color"], words_per_line=2,
-        )
-        final_video = apply_color_grade(captioned, str(tmp / "final.mp4"), niche="ballfight")
+        # 8. Color grade — no captions burned in anymore
+        final_video = apply_color_grade(muxed, str(tmp / "final.mp4"), niche="ballfight")
 
-        # 8. Upload to TikTok
+        # 9. Upload to TikTok
         tiktok_id = upload_tiktok(final_video, title, hashtags)
-
-        # 9. Backup + dashboard
-        backup_to_drive(final_video, srt_path, title)
-        update_dashboard("ballfight", title,
-                         f"tiktok publish_id: {tiktok_id}" if tiktok_id else None,
-                         ok=bool(tiktok_id), platform="tiktok")
 
     log.info("═══ Ballfight complete: %s ═══", tiktok_id or "upload failed/skipped")
 
 
-def run_pipeline(niche: Optional[str] = None) -> None:
-    if niche == "ballfight":
-        run_ballfight_pipeline()
-        return
-    niche = niche or random.choice(STOCKFOOTAGE_NICHES)
-    log.info("═══ VaultMind v4 — niche: %s ═══", niche)
-
-    ensure_font()
-    music_path             = ensure_music(duration_s=120)
-    sfx_whoosh, sfx_impact = ensure_sfx()
-
-    # Analyze curated viral videos (free, skips if <3 days old)
-    analyze_viral_videos()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-
-        # 1. Script
-        script    = generate_script(niche)
-        scenes    = script["scenes"]
-        title     = script["title"]
-        full_text = script.get("hook","") + " " + " ".join(s["text"] for s in scenes)
-        log.info("Title: %s | %d scenes", title, len(scenes))
-
-        # 2. Voiceover
-        audio_path = str(tmp/"voice.mp3")
-        generate_voiceover(full_text, audio_path)
-
-        # 3. Transcription
-        aai_data = transcribe_with_assemblyai(audio_path)
-
-        # 4. Cut points
-        cuts = detect_cut_points(audio_path, aai_data, n_scenes=len(scenes))
-
-        # 5. SRT
-        srt_path = str(tmp/"captions.srt")
-        export_srt(aai_data, srt_path)
-
-        # 6. RENDER — Priority chain (first success wins):
-        #    JSON2Video (free) → Shotstack (free sandbox) → Creatomate (paid) → MoviePy (local)
-        raw_video      = str(tmp/"raw.mp4")
-        render_args    = dict(scenes=scenes, audio_path=audio_path,
-                              niche=niche, output_path=raw_video,
-                              music_path=music_path)
-        creatomate_used = False
-
-        if json2video_render(**render_args):
-            log.info("✅ Rendered via JSON2Video")
-        elif shotstack_render(**render_args):
-            log.info("✅ Rendered via Shotstack")
-        elif creatomate_render(scenes, audio_path, niche, raw_video, music_path):
-            log.info("✅ Rendered via Creatomate")
-            creatomate_used = True   # captions already burned in
-        else:
-            log.info("⚠️ All cloud renders failed — using local MoviePy")
-            build_video_moviepy(
-                scenes=scenes, niche=niche,
-                audio_path=audio_path, aai_data=aai_data,
-                cut_points_s=cuts, output_path=raw_video,
-                music_path=music_path,
-                sfx_whoosh_path=sfx_whoosh,
-                sfx_impact_path=sfx_impact,
-            )
-
-        # 7. Animated captions — SKIP if Creatomate already burned in
-        #    transcript-highlight captions during its own render.
-        if creatomate_used:
-            log.info("Creatomate already applied captions — skipping caption step")
-            captioned_video = raw_video
-        else:
-            captioned_video = str(tmp/"captioned.mp4")
-            captioned_video = apply_beautiful_captions(
-                video_path     = raw_video,
-                srt_path       = srt_path,
-                output_path    = captioned_video,
-                accent         = NICHES[niche]["color"],
-                words_per_line = 2,
-            )
-
-        # 8. Cinematic color grade (teal-orange + unsharp)
-        final_video = str(tmp/"final.mp4")
-        final_video = apply_color_grade(captioned_video, final_video, niche=niche)
-
-        # 9. Upload
-        hashtags  = script.get("hashtags", [])
-        tag_line  = " ".join(h if h.startswith("#") else f"#{h}" for h in hashtags) \
-                    or f"#shorts #{niche} #viral #fyp"
-        desc      = f"{title}\n\n{tag_line}"
-        video_url = upload_youtube(final_video, title, desc, srt_path, tags=hashtags)
-
-        # 10. Google Drive backup
-        backup_to_drive(final_video, srt_path, title)
-
-        # 11. Dashboard
-        update_dashboard(niche, title, video_url, ok=True)
-
-    log.info("═══ v4 complete: %s ═══", video_url or "no URL")
-
-
 if __name__ == "__main__":
-    import sys
-    run_pipeline(sys.argv[1] if len(sys.argv) > 1 else None)
+    run_ballfight_pipeline()
